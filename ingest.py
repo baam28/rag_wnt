@@ -17,6 +17,51 @@ from qdrant_client.http import models as qmodels
 from config import get_settings
 
 
+# --- Sparse vector helpers (for Qdrant native sparse) ---
+
+def _tokenize_for_sparse(text: str) -> list[str]:
+    """Tokenize for sparse vector (Vietnamese and English)."""
+    text = text.lower().strip()
+    return re.findall(r"\b\w+\b", text)
+
+
+def _build_vocab(texts: list[str], max_vocab_size: int = 100_000) -> dict[str, int]:
+    """Build token -> index vocabulary from corpus. Returns dict and saves nothing."""
+    from collections import Counter
+    counter: Counter[str] = Counter()
+    for t in texts:
+        counter.update(_tokenize_for_sparse(t))
+    vocab = {}
+    for token, _ in counter.most_common(max_vocab_size):
+        vocab[token] = len(vocab)
+    return vocab
+
+
+def _text_to_sparse_vector(
+    text: str,
+    vocab: dict[str, int],
+    use_tf: bool = True,
+) -> tuple[list[int], list[float]]:
+    """Convert text to (indices, values) for Qdrant SparseVector. Uses 1+log(tf)."""
+    from math import log
+    tokens = _tokenize_for_sparse(text)
+    if not tokens:
+        return [], []
+    tf: dict[int, float] = {}
+    for t in tokens:
+        idx = vocab.get(t)
+        if idx is None:
+            continue
+        tf[idx] = tf.get(idx, 0) + 1
+    if use_tf:
+        # Sublinear: 1 + log(tf)
+        for k in tf:
+            tf[k] = 1.0 + log(tf[k])
+    indices = sorted(tf.keys())
+    values = [float(tf[i]) for i in indices]
+    return indices, values
+
+
 # --- Tokenization & text splitting ---
 
 def get_encoding():
@@ -633,28 +678,53 @@ def ingest_file(
             "total_chunks_in_db": 0,
         }
 
+    # Build sparse vocab and vectors for Qdrant native sparse
+    progress("sparse", "Building sparse vectors...", 0, 1)
+    sparse_vocab = _build_vocab(child_texts)
+    sparse_vectors: list[tuple[list[int], list[float]]] = [
+        _text_to_sparse_vector(t, sparse_vocab) for t in child_texts
+    ]
+    vocab_path = settings.persist_dir / f"{collection_name}_sparse_vocab.json"
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(sparse_vocab, f, ensure_ascii=False)
+    progress("sparse", f"Built sparse vocab ({len(sparse_vocab)} terms)", 1, 1)
+
     try:
         client.get_collection(collection_name)
     except Exception:
+        # New collection: always create with named dense + sparse vectors
         client.create_collection(
             collection_name=collection_name,
-            vectors_config=qmodels.VectorParams(
-                size=vector_size,
-                distance=qmodels.Distance.COSINE,
-            ),
+            vectors_config={
+                "dense": qmodels.VectorParams(
+                    size=vector_size,
+                    distance=qmodels.Distance.COSINE,
+                ),
+            },
+            sparse_vectors_config={
+                "sparse": qmodels.SparseVectorParams(),
+            },
         )
 
     from qdrant_client.http import models as qmodels_local
 
     ids = list(range(len(child_texts)))
-    points = [
-        qmodels_local.PointStruct(
-            id=ids[i],
-            vector=child_embeddings[i],
-            payload={**child_metadatas[i], "text": child_texts[i]},
+    points: list[qmodels_local.PointStruct] = []
+    for i in range(len(child_texts)):
+        indices, values = sparse_vectors[i]
+        sparse_vec = qmodels_local.SparseVector(indices=indices, values=values) if indices else None
+        vec_payload = {
+            "dense": child_embeddings[i],
+        }
+        if sparse_vec is not None:
+            vec_payload["sparse"] = sparse_vec
+        points.append(
+            qmodels_local.PointStruct(
+                id=ids[i],
+                vector=vec_payload,
+                payload={**child_metadatas[i], "text": child_texts[i]},
+            )
         )
-        for i in range(len(child_texts))
-    ]
 
     progress("qdrant", f"Writing {len(points)} chunks to Qdrant...", 0, 1)
     client.upsert(collection_name=collection_name, points=points)

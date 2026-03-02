@@ -1,4 +1,4 @@
-"""Retrieval: query expansion, hybrid search (vector + BM25), re-ranking, parent context."""
+"""Retrieval: query expansion, hybrid search (vector + Qdrant native sparse), re-ranking, parent context."""
 import json
 import re
 from pathlib import Path
@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -50,11 +49,41 @@ def get_qdrant_client(persist_dir: Path) -> QdrantClient:
     return QdrantClient(path=str(path))
 
 
-def _tokenize_for_bm25(text: str) -> list[str]:
-    """Simple tokenization for BM25 (Vietnamese and English)."""
+def _tokenize_for_sparse(text: str) -> list[str]:
+    """Tokenize for sparse vector (Vietnamese and English)."""
     text = text.lower().strip()
-    tokens = re.findall(r"\b\w+\b", text)
-    return tokens
+    return re.findall(r"\b\w+\b", text)
+
+
+def _query_to_sparse_vector(query: str, query_variations: list[str], vocab: dict[str, int]) -> qmodels.SparseVector | None:
+    """Build sparse vector for query + variations. Returns None if vocab empty or no tokens."""
+    from math import log
+    tokens: list[str] = []
+    tokens.extend(_tokenize_for_sparse(query))
+    for qv in query_variations:
+        tokens.extend(_tokenize_for_sparse(qv))
+    tf: dict[int, float] = {}
+    for t in tokens:
+        idx = vocab.get(t)
+        if idx is None:
+            continue
+        tf[idx] = tf.get(idx, 0) + 1
+    if not tf:
+        return None
+    for k in tf:
+        tf[k] = 1.0 + log(tf[k])
+    indices = sorted(tf.keys())
+    values = [float(tf[i]) for i in indices]
+    return qmodels.SparseVector(indices=indices, values=values)
+
+
+def _load_sparse_vocab(persist_dir: Path, collection_name: str) -> dict[str, int] | None:
+    """Load sparse vocab for collection. Returns None if not found."""
+    path = persist_dir / f"{collection_name}_sparse_vocab.json"
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def hybrid_search(
@@ -63,57 +92,53 @@ def hybrid_search(
     embeddings,
     client: QdrantClient,
     collection_name: str,
-    all_docs: list[str],
-    all_metadatas: list[dict],
-    all_ids: list[str],
+    persist_dir: Path,
     top_k: int = 20,
 ) -> list[tuple[str, dict, float]]:
     """
-    Vector search (query + variations) plus BM25 on child chunks. Merge by id, return top_k.
-    Returns list of (doc_id, metadata, score) sorted by combined relevance.
+    Hybrid search using Qdrant native sparse + dense vectors (prefetch + RRF).
+    Returns list of (doc_id, metadata, score) with payload.
     """
     q_embeddings = embeddings.embed_documents(query_variations)
-    seen_ids = set()
-    vector_scores: dict[str, float] = {}
-    n_results = max(20, top_k)
+    sparse_vocab = _load_sparse_vocab(persist_dir, collection_name)
+    query_sparse = _query_to_sparse_vector(query, query_variations, sparse_vocab) if sparse_vocab else None
+
+    prefetches: list[qmodels.Prefetch] = []
     for qe in q_embeddings:
-        resp = client.query_points(
-            collection_name=collection_name,
-            query=qe,
-            limit=n_results,
-            with_payload=False,
-            with_vectors=False,
+        prefetches.append(
+            qmodels.Prefetch(
+                query=qe,
+                using="dense",
+                limit=max(20, top_k),
+            )
         )
-        for point in (resp.points or []):
-            id_ = str(point.id)
-            if id_ in seen_ids:
-                continue
-            seen_ids.add(id_)
-            sim = float(point.score)
-            vector_scores[id_] = max(vector_scores.get(id_, 0.0), sim)
+    if query_sparse is not None:
+        prefetches.append(
+            qmodels.Prefetch(
+                query=query_sparse,
+                using="sparse",
+                limit=max(20, top_k),
+            )
+        )
 
-    tokenized_corpus = [_tokenize_for_bm25(d) for d in all_docs]
-    bm25 = BM25Okapi(tokenized_corpus)
-    query_tokens = _tokenize_for_bm25(query)
-    for qv in query_variations:
-        query_tokens.extend(_tokenize_for_bm25(qv))
-    query_tokens = list(dict.fromkeys(query_tokens))
-    bm25_scores = bm25.get_scores(query_tokens)
+    if not prefetches:
+        return []
 
-    # Normalize BM25 to ~[0,1] and merge with vector
-    id_to_idx = {aid: i for i, aid in enumerate(all_ids)}
-    max_bm = max(bm25_scores) if len(bm25_scores) else 1.0
-    combined: list[tuple[str, dict, float]] = []
-    for id_ in set(vector_scores.keys()) | set(all_ids):
-        idx = id_to_idx.get(id_)
-        vs = vector_scores.get(id_, 0.0)
-        bs = (bm25_scores[idx] / max_bm) if max_bm and idx is not None else 0.0
-        combined_score = 0.6 * vs + 0.4 * bs
-        meta = all_metadatas[idx] if idx is not None else {}
-        combined.append((id_, meta, combined_score))
+    resp = client.query_points(
+        collection_name=collection_name,
+        prefetch=prefetches,
+        query=qmodels.FusionQuery(fusion=qmodels.Fusion.RRF),
+        limit=top_k,
+        with_payload=True,
+        with_vectors=False,
+    )
 
-    combined.sort(key=lambda x: x[2], reverse=True)
-    return combined[:top_k]
+    out: list[tuple[str, dict, float]] = []
+    for point in (resp.points or []):
+        score = float(point.score) if point.score is not None else 0.0
+        payload = point.payload or {}
+        out.append((str(point.id), payload, score))
+    return out
 
 
 # --- Re-ranking ---
@@ -214,35 +239,9 @@ def _retrieve_single_collection(
 ) -> list[dict[str, Any]]:
     """
     Run full retrieval pipeline on a single collection.
+    Uses Qdrant native sparse + dense hybrid search (prefetch + RRF).
     Returns context list (may be empty).
     """
-    # Load all points (child chunks) from Qdrant to build BM25 corpus
-    all_ids: list[str] = []
-    all_docs: list[str] = []
-    all_metadatas: list[dict] = []
-
-    next_offset = None
-    while True:
-        points, next_offset = client.scroll(
-            collection_name=collection_name,
-            limit=1000,
-            offset=next_offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        if not points:
-            break
-        for p in points:
-            all_ids.append(str(p.id))
-            payload = p.payload or {}
-            all_docs.append(payload.get("text", ""))
-            all_metadatas.append(payload)
-        if next_offset is None:
-            break
-
-    if not all_ids:
-        return []
-
     variations = expand_query(
         query,
         llm,
@@ -255,11 +254,15 @@ def _retrieve_single_collection(
         embeddings,
         client,
         collection_name,
-        all_docs,
-        all_metadatas,
-        all_ids,
+        persist_dir=settings.persist_dir,
         top_k=settings.hybrid_top_k,
     )
+
+    if not candidates:
+        return []
+
+    all_ids = [c[0] for c in candidates]
+    all_docs = [(c[1].get("text", "") or "") for c in candidates]
 
     top_5 = rerank(
         query,

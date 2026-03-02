@@ -29,7 +29,7 @@ OPENAI_API_KEY=sk-your-key
 |------|-------------|
 | `config.py` | Settings: models, paths, chunk sizes, retrieval parameters |
 | `ingest.py` | Load PDF/DOCX, SemanticChunker, parent-child chunks, metadata (summary, target_question), store in Qdrant |
-| `retriever.py` | Query expansion, hybrid search (vector + BM25), re-ranking, parent context retrieval |
+| `retriever.py` | Query expansion, hybrid search (vector + Qdrant native sparse), re-ranking, parent context retrieval |
 | `app.py` | FastAPI: `/ask` with grounded answers and citations |
 | `streamlit_app.py` | Streamlit demo UI for ingest and chat |
 
@@ -42,7 +42,7 @@ OPENAI_API_KEY=sk-your-key
 ## Retrieval pipeline
 
 1. **Query expansion:** Generate several query variants.
-2. **Hybrid search:** Vector + BM25 over child chunks → top 20.
+2. **Hybrid search:** Dense vectors + Qdrant native sparse vectors over child chunks (prefetch + RRF) → top 20.
 3. **Re-ranking:** Cross-encoder → top 5.
 4. **Context:** Fetch the corresponding **parent** chunks for those 5 children to form the context for the LLM.
 
@@ -82,5 +82,5 @@ streamlit run streamlit_app.py
 ## Notes
 
 - **PDF/DOCX:** Requires `pypdf` and `python-docx`. DOCX via `unstructured` may need extra system dependencies (e.g. `libmagic`).
-- **Multilingual:** OpenAI embeddings and prompts work well for multiple languages; BM25 uses simple tokenization and remains useful.
-- **Qdrant:** Data is stored under `qdrant_db/` (configurable in `config.py` via `persist_dir`).
+- **Multilingual:** OpenAI embeddings and prompts work well for multiple languages; sparse vectors use simple tokenization for keyword match.
+- **Qdrant:** Data is stored under `qdrant_db/` (configurable in `config.py` via `persist_dir`). Hybrid search uses native sparse vectors; existing collections need to be re-ingested to get sparse indexing (new ingest creates collections with dense + sparse).
