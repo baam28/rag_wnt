@@ -1,0 +1,38 @@
+# RAG Chatbot - Semantic Retrieval Pipeline
+# Python 3.10+
+
+# Framework & LLM
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-experimental>=0.3.0
+openai>=1.0.0
+
+# Document loading
+pypdf>=4.0.0
+python-docx>=1.0.0
+
+# Vector store: Qdrant (embedded, local)
+qdrant-client>=1.8.0
+
+# Embeddings & re-ranking
+sentence-transformers>=2.2.0
+transformers>=4.40.0
+accelerate>=0.28.0
+torch>=2.2.0
+
+# BM25 keyword search
+rank-bm25>=0.2.2
+
+# Token counting
+tiktoken>=0.5.0
+
+# API & server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+streamlit>=1.29.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0

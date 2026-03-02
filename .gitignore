@@ -1,0 +1,33 @@
+# Environment and secrets (do not commit)
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project data (optional: uncomment if you don't want to track DB or uploads)
+# qdrant_db/
+# uploads/
+
+# OS
+.DS_Store
+Thumbs.db
