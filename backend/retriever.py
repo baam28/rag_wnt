@@ -205,8 +205,8 @@ def fetch_parent_context(
     context_list = []
     for i, (_, meta, score) in enumerate(top_children):
         parent_id = meta.get("parent_id")
+        page = meta.get("page")
         if not parent_id or parent_id in seen_parent_ids:
-            # Fallback: use parent_content from child metadata if stored
             content = meta.get("parent_content", "")
             if content:
                 context_list.append({
@@ -215,6 +215,7 @@ def fetch_parent_context(
                     "source": meta.get("source", "Unknown"),
                     "rank": i + 1,
                     "score": score,
+                    "page": page,
                 })
             continue
         seen_parent_ids.add(parent_id)
@@ -225,6 +226,7 @@ def fetch_parent_context(
             "source": parent.get("source", meta.get("source", "Unknown")),
             "rank": len(context_list) + 1,
             "score": score,
+            "page": page,
         })
     return context_list
 

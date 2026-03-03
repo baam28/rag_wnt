@@ -23,10 +23,16 @@ eggs/
 .vscode/
 *.swp
 *.swo
+.cursor/
 
-# Project data (optional: uncomment if you don't want to track DB or uploads)
-# qdrant_db/
+# Project runtime data
+qdrant_db/
 uploads/
+data/
+feedback.json
+
+# Temp Office lock files
+~$*
 
 # OS
 .DS_Store

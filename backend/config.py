@@ -4,6 +4,9 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
+# Project root (parent of backend/) — paths stay at root level
+_BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 class Settings(BaseSettings):
     """App settings loaded from environment."""
@@ -29,13 +32,13 @@ class Settings(BaseSettings):
     hybrid_top_k: int = 20
     rerank_top_k: int = 5
 
-    # Paths
-    data_dir: Path = Path("data")
-    persist_dir: Path = Path("qdrant_db")
-    upload_dir: Path = Path("uploads")
+    # Paths (relative to project root)
+    data_dir: Path = _BASE_DIR / "data"
+    persist_dir: Path = _BASE_DIR / "qdrant_db"
+    upload_dir: Path = _BASE_DIR / "uploads"
 
     class Config:
-        env_file = ".env"
+        env_file = str(_BASE_DIR / ".env")
         env_file_encoding = "utf-8"
         extra = "ignore"
 
