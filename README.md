@@ -27,8 +27,9 @@ rag_wnt/
 ## Stack
 
 - **Framework:** LangChain
-- **Vector Store:** Qdrant (embedded, local)
-- **Embeddings:** OpenAI `text-embedding-3-small`
+- **Vector Store:** Qdrant (embedded, local) with dense + sparse hybrid search
+- **PDF/DOCX ingestion:** Docling-based structured parsing → Markdown text (headings, lists, tables)
+- **Embeddings:** `Alibaba-NLP/gte-multilingual-base` (default, via HuggingFace) or OpenAI `text-embedding-*` when configured
 - **Re-ranker:** `cross-encoder/ms-marco-MiniLM-L-6-v2`
 - **LLM:** OpenAI (e.g. `gpt-4o-mini`)
 - **Frontend:** React 18 (CDN, no build step) + vanilla CSS
@@ -83,6 +84,9 @@ cd backend && uvicorn app:app --reload --host 0.0.0.0 --port 8000
   - View all collections with expand/collapse to see individual documents
   - Delete individual documents, entire collections, or the whole database (with confirmation)
   - View uploaded documents directly from the admin panel
+- **Drug Price Lookup (Vietnam):**
+  - Detects medicine price queries in Vietnamese
+  - Fetches live retail prices from external pharmacy sources and merges them into RAG context
 - **Feedback Analytics:**
   - Summary stats: total ratings, thumbs up count, thumbs down count, positive rate percentage
   - "Thumbs down" tab: view all negatively rated Q&A pairs with user comments
@@ -98,14 +102,16 @@ cd backend && uvicorn app:app --reload --host 0.0.0.0 --port 8000
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/ask` | Ask a question with optional chat history |
-| `POST` | `/ingest-file` | Upload and ingest a PDF/DOCX file |
-| `GET` | `/collections` | List all collections |
-| `GET` | `/collections/{name}/documents` | List documents in a collection |
-| `DELETE` | `/collections/{name}` | Delete a collection |
-| `DELETE` | `/collections/{name}/documents/{source}` | Delete a document |
-| `POST` | `/db/clear` | Clear entire Qdrant database |
-| `POST` | `/feedback` | Submit user feedback (rating + comment) |
+| `GET` | `/health` | Simple health check |
+| `POST` | `/ask` | Ask a question with optional chat history (RAG over all collections) |
+| `POST` | `/ingest-file` | Upload and ingest a PDF/DOCX file into a named collection |
+| `POST` | `/db/clear` | Clear the entire Qdrant database directory |
+| `GET` | `/admin/collections` | List all Qdrant collections |
+| `GET` | `/admin/docs?collection_name=...` | List documents (logical sources) in a collection |
+| `DELETE` | `/admin/docs` | Delete all chunks + parent metadata for a given `source` in a collection |
+| `DELETE` | `/admin/collections/{collection_name}` | Delete a whole collection and its metadata files |
+| `POST` | `/drug-price` | Look up real-time retail prices for a medicine in Vietnam |
+| `POST` | `/feedback` | Submit user feedback (rating + optional comment) |
 | `GET` | `/admin/feedback` | Get feedback analytics and entries |
 | `GET` | `/uploads/{filename}` | Serve uploaded documents |
 

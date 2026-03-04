@@ -49,8 +49,9 @@ function App() {
   const [askError, setAskError] = useState("");
 
   const [uploadFile, setUploadFile] = useState(null);
-  const [collectionName, setCollectionName] = useState("rag_chatbot");
-  const [skipMetadata, setSkipMetadata] = useState(false);
+  const [collectionName, setCollectionName] = useState("");
+  const [newCollectionMode, setNewCollectionMode] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState("");
   const [ingestStatus, setIngestStatus] = useState("");
   const [isIngesting, setIsIngesting] = useState(false);
 
@@ -198,8 +199,9 @@ function App() {
       const data = await resp.json();
       const fullText = data.answer || "";
       const sources = data.sources || [];
+      const priceData = data.price_data || null;
 
-      await animateAnswer(sid, nextMessages, fullText, sources);
+      await animateAnswer(sid, nextMessages, fullText, sources, priceData);
     } catch (err) {
       console.error(err);
       setAskError(String(err));
@@ -208,12 +210,12 @@ function App() {
     }
   }
 
-  function animateAnswer(sessionId, baseMessages, fullText, sources) {
+  function animateAnswer(sessionId, baseMessages, fullText, sources, priceData) {
     return new Promise((resolve) => {
       const assistantIndex = baseMessages.length;
       let currentMessages = [
         ...baseMessages,
-        { role: "assistant", content: "", sources },
+        { role: "assistant", content: "", sources, priceData },
       ];
       updateActiveSessionMessages(sessionId, currentMessages);
 
@@ -252,13 +254,19 @@ function App() {
       setIngestStatus("Chọn ít nhất một tệp để ingest.");
       return;
     }
+    const targetCollection = newCollectionMode
+      ? newCollectionName.trim()
+      : collectionName;
+    if (!targetCollection) {
+      setIngestStatus("Vui lòng chọn hoặc tạo một collection.");
+      return;
+    }
     setIsIngesting(true);
     setIngestStatus("Đang tải lên và xử lý...");
     try {
       const form = new FormData();
       form.append("file", uploadFile);
-      form.append("collection_name", collectionName || "rag_chatbot");
-      form.append("skip_metadata_llm", skipMetadata ? "true" : "false");
+      form.append("collection_name", targetCollection);
       const resp = await fetch(`${API_BASE}/ingest-file`, {
         method: "POST",
         body: form,
@@ -274,6 +282,10 @@ function App() {
         setIngestStatus(
           `Đã ingest: ${data.num_parents} parent, ${data.num_children} child → collection ${data.collection_name}`
         );
+        await fetchCollections();
+        setNewCollectionMode(false);
+        setNewCollectionName("");
+        setCollectionName(data.collection_name || targetCollection);
       }
     } catch (err) {
       console.error(err);
@@ -317,6 +329,9 @@ function App() {
       }
       const data = await resp.json();
       setCollections(data || []);
+      if (data && data.length > 0 && !collectionName && !newCollectionMode) {
+        setCollectionName(data[0].name);
+      }
     } catch (err) {
       console.error(err);
       setCollectionsError(String(err));
@@ -605,27 +620,43 @@ function App() {
                     />
                   </div>
                   <div className="admin-field">
-                    <label className="admin-label">Tên collection</label>
-                    <input
-                      type="text"
+                    <label className="admin-label">Collection</label>
+                    <select
                       className="admin-input"
-                      value={collectionName}
-                      onChange={(e) => setCollectionName(e.target.value)}
-                      placeholder="vd: my_docs"
-                    />
+                      value={newCollectionMode ? "__new__" : collectionName}
+                      onChange={(e) => {
+                        if (e.target.value === "__new__") {
+                          setNewCollectionMode(true);
+                          setCollectionName("");
+                        } else {
+                          setNewCollectionMode(false);
+                          setNewCollectionName("");
+                          setCollectionName(e.target.value);
+                        }
+                      }}
+                    >
+                      {collections.length === 0 && !newCollectionMode && (
+                        <option value="" disabled>-- Chưa có collection --</option>
+                      )}
+                      {collections.map((c) => (
+                        <option key={c.name} value={c.name}>{c.name}</option>
+                      ))}
+                      <option value="__new__">＋ Tạo collection mới</option>
+                    </select>
                   </div>
-                  <div className="admin-field admin-field--row">
-                    <input
-                      id="skip-meta"
-                      type="checkbox"
-                      checked={skipMetadata}
-                      onChange={(e) => setSkipMetadata(e.target.checked)}
-                      className="admin-checkbox"
-                    />
-                    <label htmlFor="skip-meta" className="admin-label admin-label--inline">
-                      Bỏ qua LLM summary (nhanh hơn)
-                    </label>
-                  </div>
+                  {newCollectionMode && (
+                    <div className="admin-field">
+                      <label className="admin-label">Tên collection mới</label>
+                      <input
+                        type="text"
+                        className="admin-input"
+                        value={newCollectionName}
+                        onChange={(e) => setNewCollectionName(e.target.value)}
+                        placeholder="vd: duoc_thu"
+                        autoFocus
+                      />
+                    </div>
+                  )}
                   <div className="admin-actions">
                     <button
                       type="submit"
@@ -1015,6 +1046,8 @@ function MessageBubble({ message, onFeedback }) {
     }
   };
 
+  const priceData = message.priceData || null;
+
   return (
     <div className={`chat-message ${isUser ? "user" : "assistant"}`}>
       {isUser ? (
@@ -1023,6 +1056,51 @@ function MessageBubble({ message, onFeedback }) {
         <div
           dangerouslySetInnerHTML={{ __html: formatAssistantText(message.content) }}
         />
+      )}
+      {!isUser && priceData && priceData.prices && priceData.prices.length > 0 && (
+        <div className="price-card">
+          <div className="price-card-header">
+            <span className="price-card-title">{priceData.drug_name || "Giá thuốc"}</span>
+            {priceData.is_prescription && (
+              <span className="price-card-rx">Rx</span>
+            )}
+          </div>
+          {priceData.price_range && (
+            <div className="price-card-range">{priceData.price_range}</div>
+          )}
+          <div className="price-card-list">
+            {priceData.prices.map((p, pi) => (
+              <div key={pi} className="price-card-row">
+                <span className="price-card-source">{p.source_name || "—"}</span>
+                <span className="price-card-price">{p.price || "N/A"}</span>
+                <span className="price-card-unit">/{p.unit || ""}</span>
+                {p.source_url && (
+                  <a
+                    className="price-card-link"
+                    href={p.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >↗</a>
+                )}
+              </div>
+            ))}
+          </div>
+          {priceData.disclaimer && (
+            <div className="price-card-disclaimer">{priceData.disclaimer}</div>
+          )}
+        </div>
+      )}
+      {!isUser && priceData && priceData.is_prescription && (!priceData.prices || priceData.prices.length === 0) && (
+        <div className="price-card price-card--rx">
+          <div className="price-card-header">
+            <span className="price-card-title">{priceData.drug_name || "Thuốc kê đơn"}</span>
+            <span className="price-card-rx">Rx</span>
+          </div>
+          <div className="price-card-range">{priceData.notes || "Thuốc kê đơn – giá không niêm yết."}</div>
+          {priceData.disclaimer && (
+            <div className="price-card-disclaimer">{priceData.disclaimer}</div>
+          )}
+        </div>
       )}
       {!isUser && hasSources && (
         <>

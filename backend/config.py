@@ -12,20 +12,24 @@ class Settings(BaseSettings):
     """App settings loaded from environment."""
 
     openai_api_key: str = ""
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "Alibaba-NLP/gte-multilingual-base"
     llm_model: str = "gpt-4o-mini"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # Chunk sizes
     child_chunk_tokens: int = 150
     parent_chunk_tokens: int = 700
-    chunk_strategy: str = "semantic_tokens"
+    chunk_strategy: str = "auto"
     parent_chunk_paragraphs: int = 4
     child_chunk_paragraphs: int = 1
     parent_chunk_sentences: int = 8
     child_chunk_sentences: int = 3
     parent_chunk_words: int = 400
     child_chunk_words: int = 120
+
+    # Embedding parallelism
+    embed_batch_size: int = 64
+    embed_max_workers: int = 4
 
     # Retrieval
     query_expansion_count: int = 3

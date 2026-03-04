@@ -529,6 +529,12 @@ button {
   border: 1px solid #d1d5db;
   border-radius: 8px;
   color: #111827;
+  background-color: #fff;
+}
+
+select.admin-input {
+  cursor: pointer;
+  appearance: auto;
 }
 
 .admin-input:focus {
@@ -1371,5 +1377,118 @@ button {
   border-top: 1px dashed #e5e7eb;
   color: #6b7280;
   font-style: italic;
+}
+
+/* --- Price card (drug price lookup) --- */
+
+.price-card {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: linear-gradient(135deg, #f0fdf4, #ecfeff);
+  border: 1px solid #a7f3d0;
+  border-radius: 10px;
+  font-size: 0.85rem;
+}
+
+.price-card--rx {
+  background: linear-gradient(135deg, #fef9c3, #fff7ed);
+  border-color: #fcd34d;
+}
+
+.price-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: #065f46;
+}
+
+.price-card--rx .price-card-header {
+  color: #92400e;
+}
+
+.price-card-title {
+  flex: 1;
+}
+
+.price-card-rx {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #fff;
+  background: #f59e0b;
+  border-radius: 4px;
+  letter-spacing: 0.03em;
+}
+
+.price-card-range {
+  padding: 0.35rem 0;
+  font-weight: 600;
+  color: #059669;
+  font-size: 0.95rem;
+}
+
+.price-card--rx .price-card-range {
+  color: #b45309;
+  font-weight: 500;
+}
+
+.price-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+}
+
+.price-card-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  background: rgba(255,255,255,0.7);
+  border-radius: 6px;
+}
+
+.price-card-source {
+  font-weight: 500;
+  color: #374151;
+  min-width: 90px;
+}
+
+.price-card-price {
+  font-weight: 700;
+  color: #047857;
+}
+
+.price-card-unit {
+  color: #6b7280;
+  font-size: 0.8rem;
+}
+
+.price-card-link {
+  margin-left: auto;
+  color: #2563eb;
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+
+.price-card-link:hover {
+  text-decoration: underline;
+}
+
+.price-card-disclaimer {
+  margin-top: 0.5rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed #a7f3d0;
+  font-size: 0.75rem;
+  color: #6b7280;
+  line-height: 1.4;
+}
+
+.price-card--rx .price-card-disclaimer {
+  border-top-color: #fcd34d;
 }
 

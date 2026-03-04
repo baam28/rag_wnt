@@ -13,6 +13,24 @@ from qdrant_client.http import models as qmodels
 from config import get_settings
 
 
+def _fix_position_ids(model) -> None:
+    """Repair corrupted ``position_ids`` buffers after model load.
+
+    ``transformers >= 5`` lazy-materialises weights which can leave
+    ``persistent=False`` buffers (like ``position_ids``) filled with
+    uninitialised memory.  Re-creating the buffer with ``torch.arange``
+    restores the correct values.
+    """
+    import torch
+
+    for module in model.modules():
+        if hasattr(module, "position_ids") and isinstance(module.position_ids, torch.Tensor):
+            n = module.position_ids.size(0)
+            module.register_buffer(
+                "position_ids", torch.arange(n, dtype=torch.long), persistent=False,
+            )
+
+
 # --- Query expansion ---
 
 def expand_query(query: str, llm: ChatOpenAI, num_variations: int = 3) -> list[str]:
@@ -26,7 +44,6 @@ Câu hỏi gốc: {query}"""
         resp = llm.invoke(prompt.format(n=num_variations, query=query))
         content = resp.content if hasattr(resp, "content") else str(resp)
         lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
-        # Remove numbering like "1.", "2."
         cleaned = []
         for line in lines[: num_variations + 2]:
             line = re.sub(r"^[\d\.\)\-\*]+\s*", "", line).strip()
@@ -302,7 +319,9 @@ def retrieve(
     else:
         embeddings = HuggingFaceEmbeddings(
             model_name=settings.embedding_model,
+            model_kwargs={"trust_remote_code": True, "device": "cpu"},
         )
+        _fix_position_ids(embeddings.client)
     llm = ChatOpenAI(
         model=settings.llm_model,
         api_key=settings.openai_api_key,

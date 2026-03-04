@@ -1,20 +1,43 @@
 """Ingestion: load PDF/DOCX, semantic chunking, parent-child hierarchy, metadata (summary, target_question)."""
+import base64
 import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import tiktoken
+from docling.document_converter import DocumentConverter  # type: ignore[import-untyped]
 from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from config import get_settings
+
+TABLE_START = "<!--TABLE_START-->"
+TABLE_END = "<!--TABLE_END-->"
+
+
+def _fix_position_ids(model) -> None:
+    """Repair corrupted ``position_ids`` buffers after model load.
+
+    ``transformers >= 5`` lazy-materialises weights which can leave
+    ``persistent=False`` buffers (like ``position_ids``) filled with
+    uninitialised memory.  Re-creating the buffer with ``torch.arange``
+    restores the correct values.
+    """
+    import torch
+
+    for module in model.modules():
+        if hasattr(module, "position_ids") and isinstance(module.position_ids, torch.Tensor):
+            n = module.position_ids.size(0)
+            module.register_buffer(
+                "position_ids", torch.arange(n, dtype=torch.long), persistent=False,
+            )
 
 
 # --- Sparse vector helpers (for Qdrant native sparse) ---
@@ -86,8 +109,24 @@ def chunk_by_tokens(text: str, max_tokens: int, overlap: int = 50) -> list[str]:
 
 
 def _split_paragraphs(text: str) -> list[str]:
-    """Split text into paragraphs separated by blank lines."""
-    parts = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    """Split text into paragraphs, keeping TABLE_START...TABLE_END blocks atomic."""
+    table_pattern = re.compile(
+        rf"({re.escape(TABLE_START)}.*?{re.escape(TABLE_END)})",
+        re.DOTALL,
+    )
+    segments = table_pattern.split(text)
+    parts: list[str] = []
+    for seg in segments:
+        seg_stripped = seg.strip()
+        if not seg_stripped:
+            continue
+        if seg_stripped.startswith(TABLE_START):
+            parts.append(seg_stripped)
+        else:
+            for p in re.split(r"\n\s*\n+", seg):
+                p = p.strip()
+                if p:
+                    parts.append(p)
     if not parts and text.strip():
         parts = [text.strip()]
     return parts
@@ -210,6 +249,51 @@ def auto_select_chunk_strategy(documents: list[Document]) -> str:
     return "semantic_tokens"
 
 
+def _load_pdf_docling(path: Path, settings=None) -> list[Document]:
+    """
+    Load PDF via Docling and convert it to rich Markdown text for RAG.
+
+    - Uses Docling's DocumentConverter to parse the PDF.
+    - Exports the full document to Markdown (headings, lists, tables).
+    - Ignores images (no GPT-4 Vision).
+    """
+    if settings is None:
+        settings = get_settings()
+
+    converter = DocumentConverter()
+    try:
+        # Docling auto-detects the format from the file path
+        result = converter.convert(str(path))
+    except Exception:
+        # On failure, return empty and let caller handle the error
+        return []
+
+    doc = getattr(result, "document", None)
+    if doc is None:
+        return []
+
+    try:
+        markdown = doc.export_to_markdown()
+    except Exception:
+        return []
+
+    markdown = (markdown or "").strip()
+    if not markdown:
+        return []
+
+    return [
+        Document(
+            page_content=markdown,
+            metadata={
+                "source": path.name,
+                "file_path": str(path),
+                # Treat entire Docling output as a single logical page/section
+                "page": 0,
+            },
+        )
+    ]
+
+
 def _load_docx(path: Path) -> list[Document]:
     """Load DOCX via python-docx (no extra system deps)."""
     try:
@@ -235,7 +319,7 @@ def _load_docx(path: Path) -> list[Document]:
     return [Document(page_content=text, metadata={"source": path.name, "file_path": str(path)})]
 
 
-def load_document(file_path: Path) -> list[Document]:
+def load_document(file_path: Path, settings=None) -> list[Document]:
     """Load a single PDF or DOCX file into LangChain documents."""
     path = Path(file_path)
     if not path.exists():
@@ -243,8 +327,7 @@ def load_document(file_path: Path) -> list[Document]:
 
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        loader = PyPDFLoader(str(path))
-        docs = loader.load()
+        docs = _load_pdf_docling(path, settings=settings)
     elif suffix in (".docx", ".doc"):
         docs = _load_docx(path)
     else:
@@ -258,6 +341,39 @@ def load_document(file_path: Path) -> list[Document]:
 
 # --- Parent and child chunking ---
 
+_PRESPLIT_THRESHOLD_TOKENS = 50_000
+_PRESPLIT_SECTION_TOKENS = 10_000
+
+
+def _presplit_large_doc(doc: Document) -> list[Document]:
+    """Split a very large document into sections of ~_PRESPLIT_SECTION_TOKENS
+    on paragraph boundaries so SemanticChunker doesn't choke."""
+    total = count_tokens(doc.page_content)
+    if total <= _PRESPLIT_THRESHOLD_TOKENS:
+        return [doc]
+
+    paras = _split_paragraphs(doc.page_content)
+    sections: list[Document] = []
+    buf: list[str] = []
+    buf_tokens = 0
+    for p in paras:
+        n = count_tokens(p)
+        if buf_tokens + n > _PRESPLIT_SECTION_TOKENS and buf:
+            sections.append(
+                Document(page_content="\n\n".join(buf), metadata=dict(doc.metadata))
+            )
+            buf = [p]
+            buf_tokens = n
+        else:
+            buf.append(p)
+            buf_tokens += n
+    if buf:
+        sections.append(
+            Document(page_content="\n\n".join(buf), metadata=dict(doc.metadata))
+        )
+    return sections
+
+
 def semantic_parent_chunks(
     documents: list[Document],
     parent_target_tokens: int,
@@ -265,12 +381,15 @@ def semantic_parent_chunks(
 ) -> list[Document]:
     """
     Use SemanticChunker to get semantic boundaries, then merge into parent-sized chunks.
+    Large documents are pre-split into sections to prevent timeout.
     """
     semantic = SemanticChunker(embeddings=embeddings)
     all_splits: list[Document] = []
     for doc in documents:
-        splits = semantic.split_documents([doc])
-        all_splits.extend(splits)
+        sections = _presplit_large_doc(doc)
+        for section in sections:
+            splits = semantic.split_documents([section])
+            all_splits.extend(splits)
 
     parents: list[Document] = []
     current_text: list[str] = []
@@ -556,8 +675,108 @@ def get_qdrant_client(persist_dir: Path) -> QdrantClient:
     return QdrantClient(path=str(path))
 
 
+def _ensure_collection(
+    client: QdrantClient,
+    collection_name: str,
+    vector_size: int,
+) -> None:
+    """Create collection if missing; recreate if schema is incompatible or corrupted."""
+    try:
+        info = client.get_collection(collection_name)
+        dense_cfg = None
+        vectors_cfg = getattr(info.config.params, "vectors", None)
+        if isinstance(vectors_cfg, dict):
+            dense_cfg = vectors_cfg.get("dense")
+        else:
+            dense_cfg = getattr(vectors_cfg, "dense", None)
+        if dense_cfg and getattr(dense_cfg, "size", None) == vector_size:
+            return
+        try:
+            client.delete_collection(collection_name)
+        except Exception:
+            pass
+    except Exception:
+        ...
+
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config={
+            "dense": qmodels.VectorParams(
+                size=vector_size,
+                distance=qmodels.Distance.COSINE,
+            ),
+        },
+        sparse_vectors_config={
+            "sparse": qmodels.SparseVectorParams(
+                index=qmodels.SparseIndexParams(on_disk=False),
+            ),
+        },
+    )
+
+
 def _noop_progress(step: str, msg: str, current: int = 0, total: int = 0) -> None:
     pass
+
+
+# --- Parallel embedding ---
+
+def _parallel_embed(
+    embeddings,
+    texts: list[str],
+    batch_size: int = 64,
+    max_workers: int = 4,
+    progress_fn: Optional[Callable[[str, str, int, int], None]] = None,
+) -> list[list[float]]:
+    """Embed texts in parallel batches using a thread pool."""
+    if not texts:
+        return []
+
+    batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+    total_batches = len(batches)
+
+    if total_batches <= 1:
+        if progress_fn:
+            progress_fn("embed", f"Embedding {len(texts)} chunks...", 0, 1)
+        result = embeddings.embed_documents(texts)
+        if progress_fn:
+            progress_fn("embed", f"Embedded {len(result)} chunks", 1, 1)
+        return result
+
+    all_embeddings: list[Optional[list[list[float]]]] = [None] * total_batches
+    completed = 0
+
+    if progress_fn:
+        progress_fn("embed", f"Embedding {len(texts)} chunks in {total_batches} batches...", 0, total_batches)
+
+    def _embed_batch(idx: int, batch: list[str]) -> tuple[int, list[list[float]]]:
+        import time as _time
+        for attempt in range(5):
+            try:
+                return idx, embeddings.embed_documents(batch)
+            except Exception as e:
+                if "rate_limit" in str(e).lower() or "429" in str(e):
+                    wait = 2 ** attempt
+                    _time.sleep(wait)
+                    continue
+                raise
+        return idx, embeddings.embed_documents(batch)
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, total_batches)) as pool:
+        futures = {
+            pool.submit(_embed_batch, i, batch): i
+            for i, batch in enumerate(batches)
+        }
+        for future in as_completed(futures):
+            idx, batch_result = future.result()
+            all_embeddings[idx] = batch_result
+            completed += 1
+            if progress_fn:
+                progress_fn("embed", f"Batch {completed}/{total_batches} done", completed, total_batches)
+
+    result: list[list[float]] = []
+    for batch_result in all_embeddings:
+        result.extend(batch_result)
+    return result
 
 
 # --- Full file ingestion ---
@@ -566,7 +785,6 @@ def ingest_file(
     file_path: Path,
     *,
     collection_name: str = "rag_chatbot",
-    skip_metadata_llm: bool = False,
     on_progress: Optional[Callable[[str, str, int, int], None]] = None,
 ) -> dict[str, Any]:
     """
@@ -581,7 +799,7 @@ def ingest_file(
 
     file_path = Path(file_path)
     progress("load", "Loading file...", 0, 1)
-    documents = load_document(file_path)
+    documents = load_document(file_path, settings=settings)
     if not documents:
         return {"error": "No content extracted", "file": str(file_path)}
     progress("load", f"Loaded {len(documents)} page(s)", 1, 1)
@@ -594,7 +812,9 @@ def ingest_file(
     else:
         embeddings = HuggingFaceEmbeddings(
             model_name=settings.embedding_model,
+            model_kwargs={"trust_remote_code": True, "device": "cpu"},
         )
+        _fix_position_ids(embeddings.client)
     llm = ChatOpenAI(
         model=settings.llm_model,
         api_key=settings.openai_api_key,
@@ -620,18 +840,11 @@ def ingest_file(
     parent_meta: dict[str, dict] = {}
 
     for i, parent in enumerate(parents):
-        if not skip_metadata_llm:
-            progress("metadata", f"Summary for parent {i + 1}/{len(parents)}...", i + 1, len(parents))
+        progress("metadata", f"Summary for parent {i + 1}/{len(parents)}...", i + 1, len(parents))
         parent_id = hashlib.sha256(
             (parent.page_content + str(i)).encode()
         ).hexdigest()[:16]
-        summary = ""
-        target_question = ""
-        if not skip_metadata_llm:
-            summary, target_question = add_parent_metadata(parent, llm)
-        else:
-            summary = parent.page_content[:200]
-            target_question = "Nội dung đoạn văn là gì?"
+        summary, target_question = add_parent_metadata(parent, llm)
 
         parent_meta[parent_id] = {
             "content": parent.page_content,
@@ -652,9 +865,18 @@ def ingest_file(
     settings.persist_dir.mkdir(parents=True, exist_ok=True)
     client = get_qdrant_client(settings.persist_dir)
 
+    # Merge parent metadata with existing (supports multi-file ingestion)
     parents_path = settings.persist_dir / f"{collection_name}_parents.json"
+    existing_parents: dict = {}
+    if parents_path.exists():
+        try:
+            with open(parents_path, "r", encoding="utf-8") as f:
+                existing_parents = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing_parents = {}
+    existing_parents.update(parent_meta)
     with open(parents_path, "w", encoding="utf-8") as f:
-        json.dump(parent_meta, f, ensure_ascii=False, indent=2)
+        json.dump(existing_parents, f, ensure_ascii=False, indent=2)
 
     child_texts = [c.page_content for c in all_children]
     child_metadatas = []
@@ -664,9 +886,13 @@ def ingest_file(
             m["parent_content"] = m["parent_content"][:30000] + "..."
         child_metadatas.append(m)
 
-    progress("embed", f"Embedding {len(child_texts)} chunks...", 0, 1)
-    child_embeddings = embeddings.embed_documents(child_texts)
-    progress("embed", f"Embedded {len(child_embeddings)} chunks", 1, 1)
+    child_embeddings = _parallel_embed(
+        embeddings,
+        child_texts,
+        batch_size=getattr(settings, "embed_batch_size", 64),
+        max_workers=getattr(settings, "embed_max_workers", 4),
+        progress_fn=progress,
+    )
 
     vector_size = len(child_embeddings[0]) if child_embeddings else 0
     if vector_size == 0:
@@ -678,58 +904,58 @@ def ingest_file(
             "total_chunks_in_db": 0,
         }
 
-    # Build sparse vocab and vectors for Qdrant native sparse
-    progress("sparse", "Building sparse vectors...", 0, 1)
-    sparse_vocab = _build_vocab(child_texts)
-    sparse_vectors: list[tuple[list[int], list[float]]] = [
-        _text_to_sparse_vector(t, sparse_vocab) for t in child_texts
-    ]
+    # --- Build / merge sparse vocab & vectors (Python-side sparse index) ---
+    progress("sparse", "Building sparse vocab and vectors...", 0, 1)
     vocab_path = settings.persist_dir / f"{collection_name}_sparse_vocab.json"
+    existing_vocab: dict[str, int] = {}
+    if vocab_path.exists():
+        try:
+            with open(vocab_path, "r", encoding="utf-8") as f:
+                existing_vocab = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing_vocab = {}
+
+    new_vocab = _build_vocab(child_texts)
+    merged_vocab = dict(existing_vocab)
+    next_idx = max(merged_vocab.values(), default=-1) + 1
+    for token in new_vocab:
+        if token not in merged_vocab:
+            merged_vocab[token] = next_idx
+            next_idx += 1
+
+    sparse_vectors: list[tuple[list[int], list[float]]] = [
+        _text_to_sparse_vector(t, merged_vocab) for t in child_texts
+    ]
     with open(vocab_path, "w", encoding="utf-8") as f:
-        json.dump(sparse_vocab, f, ensure_ascii=False)
-    progress("sparse", f"Built sparse vocab ({len(sparse_vocab)} terms)", 1, 1)
+        json.dump(merged_vocab, f, ensure_ascii=False)
+    progress("sparse", f"Built sparse vocab ({len(merged_vocab)} terms)", 1, 1)
 
+    _ensure_collection(client, collection_name, vector_size)
+
+    # Determine ID offset so new points don't overwrite existing ones
     try:
-        client.get_collection(collection_name)
+        id_offset = client.count(collection_name=collection_name, exact=True).count
     except Exception:
-        # New collection: always create with named dense + sparse vectors
-        client.create_collection(
-            collection_name=collection_name,
-            vectors_config={
-                "dense": qmodels.VectorParams(
-                    size=vector_size,
-                    distance=qmodels.Distance.COSINE,
-                ),
-            },
-            sparse_vectors_config={
-                "sparse": qmodels.SparseVectorParams(),
-            },
-        )
+        id_offset = 0
 
-    from qdrant_client.http import models as qmodels_local
-
-    ids = list(range(len(child_texts)))
-    points: list[qmodels_local.PointStruct] = []
+    # Build Qdrant points (dense + sparse vectors)
+    points: list[qmodels.PointStruct] = []
     for i in range(len(child_texts)):
         indices, values = sparse_vectors[i]
-        sparse_vec = qmodels_local.SparseVector(indices=indices, values=values) if indices else None
-        vec_payload = {
-            "dense": child_embeddings[i],
+        point_kwargs: dict[str, Any] = {
+            "id": id_offset + i,
+            "vector": {"dense": child_embeddings[i]},
+            "payload": {**child_metadatas[i], "text": child_texts[i]},
         }
-        if sparse_vec is not None:
-            vec_payload["sparse"] = sparse_vec
-        points.append(
-            qmodels_local.PointStruct(
-                id=ids[i],
-                vector=vec_payload,
-                payload={**child_metadatas[i], "text": child_texts[i]},
-            )
-        )
+        if indices:
+            sparse_vec = qmodels.SparseVector(indices=indices, values=values)
+            point_kwargs["vector"]["sparse"] = sparse_vec
+        points.append(qmodels.PointStruct(**point_kwargs))
 
     progress("qdrant", f"Writing {len(points)} chunks to Qdrant...", 0, 1)
     client.upsert(collection_name=collection_name, points=points)
 
-    existing = client.count(collection_name=collection_name, exact=True).count
+    total_in_db = client.count(collection_name=collection_name, exact=True).count
     progress("done", f"Done: {len(parents)} parents, {len(all_children)} children", 1, 1)
 
     return {
@@ -737,14 +963,13 @@ def ingest_file(
         "collection_name": collection_name,
         "num_parents": len(parents),
         "num_children": len(all_children),
-        "total_chunks_in_db": existing + len(all_children),
+        "total_chunks_in_db": total_in_db,
     }
 
 
 def ingest_directory(
     dir_path: Path,
     collection_name: str = "rag_chatbot",
-    skip_metadata_llm: bool = False,
     on_progress: Optional[Callable[[str, str, int, int], None]] = None,
 ) -> list[dict[str, Any]]:
     """Ingest all PDF and DOCX files in a directory."""
@@ -755,7 +980,6 @@ def ingest_directory(
                 r = ingest_file(
                     path,
                     collection_name=collection_name,
-                    skip_metadata_llm=skip_metadata_llm,
                     on_progress=on_progress,
                 )
                 results.append(r)

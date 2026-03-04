@@ -1,4 +1,5 @@
 """RAG Chatbot API: retrieval, grounded answers with citations."""
+import asyncio
 from typing import Any, Optional
 from pathlib import Path
 import shutil
@@ -16,6 +17,7 @@ from qdrant_client.http import models as qmodels
 from config import get_settings
 from retriever import retrieve, get_qdrant_client
 from ingest import ingest_file
+from drug_price_tool import get_vietnam_drug_price, detect_price_query
 
 
 # --- Prompts (answer generation) ---
@@ -34,6 +36,22 @@ Câu hỏi: {question}
 
 Hãy trả lời dựa trên context trên. Gắn [Source N] cho mỗi nguồn bạn dùng. Nếu không đủ thông tin, hãy nói "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này." """
 
+PRICE_SYSTEM_PROMPT = """Bạn là trợ lý tra cứu giá thuốc tại Việt Nam.
+- Trình bày thông tin giá thuốc từ context một cách rõ ràng: tên thuốc, giá, đơn vị bán, nguồn (nhà thuốc).
+- Nếu context chứa thông tin giá, hãy trình bày đầy đủ. Gắn [Source N] cho nguồn bạn dùng.
+- Nếu thuốc là thuốc kê đơn (Rx), hãy nói rõ và khuyên người dùng liên hệ nhà thuốc.
+- Luôn kèm lưu ý: giá có thể thay đổi tùy thời điểm và địa điểm, nên liên hệ nhà thuốc hoặc dược sĩ để xác nhận.
+- Nếu có thêm thông tin từ tài liệu nội bộ (liều dùng, chỉ định, v.v.), hãy bổ sung.
+- Trả lời bằng tiếng Việt."""
+
+PRICE_USER_PROMPT_TEMPLATE = """Context (bao gồm kết quả tra cứu giá và tài liệu liên quan):
+
+{context}
+
+Câu hỏi: {question}
+
+Hãy trả lời dựa trên context, trình bày giá thuốc rõ ràng. Gắn [Source N] cho nguồn. Kèm lưu ý về việc xác nhận giá với nhà thuốc/dược sĩ."""
+
 
 def build_context_block(context_list: list[dict[str, Any]]) -> str:
     """Format retrieved context with [Source N] labels."""
@@ -49,6 +67,8 @@ def _generate_with_openai(
     query: str,
     context_list: list[dict[str, Any]],
     history: Optional[list[dict[str, str]]] = None,
+    system_prompt: Optional[str] = None,
+    user_template: Optional[str] = None,
 ) -> str:
     """
     Generate answer from context using OpenAI.
@@ -62,7 +82,8 @@ def _generate_with_openai(
         return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)"
 
     context_block = build_context_block(context_list)
-    user_msg = USER_PROMPT_TEMPLATE.format(context=context_block, question=query)
+    template = user_template or USER_PROMPT_TEMPLATE
+    user_msg = template.format(context=context_block, question=query)
     llm = ChatOpenAI(
         model=settings.llm_model,
         api_key=settings.openai_api_key,
@@ -70,7 +91,7 @@ def _generate_with_openai(
     )
 
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
     ]
     if history:
         for msg in history[-8:]:
@@ -91,9 +112,14 @@ def generate_answer(
     query: str,
     context_list: list[dict[str, Any]],
     history: Optional[list[dict[str, str]]] = None,
+    system_prompt: Optional[str] = None,
+    user_template: Optional[str] = None,
 ) -> str:
     """Return a grounded answer with citations (OpenAI), aware of prior chat history."""
-    return _generate_with_openai(query, context_list, history=history)
+    return _generate_with_openai(
+        query, context_list, history=history,
+        system_prompt=system_prompt, user_template=user_template,
+    )
 
 
 # --- FastAPI app ---
@@ -127,6 +153,7 @@ class AskResponse(BaseModel):
     sources: list[dict[str, Any]]
     has_context: bool
     collection_name: Optional[str] = None
+    price_data: Optional[dict[str, Any]] = None
 
 
 class IngestResponse(BaseModel):
@@ -157,13 +184,42 @@ def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
     try:
-        context_list = retrieve(req.question)
+        is_price, drug_name = detect_price_query(req.question)
+        price_data: Optional[dict[str, Any]] = None
+
+        if is_price and drug_name:
+            try:
+                price_data = get_vietnam_drug_price(drug_name)
+            except Exception:
+                price_data = None
+
+        try:
+            context_list = retrieve(req.question)
+        except Exception:
+            context_list = []
+
+        has_price_context = False
+        if price_data and (
+            price_data.get("prices")
+            or price_data.get("price_range")
+            or price_data.get("is_prescription")
+        ):
+            price_ctx = _format_price_as_context(price_data)
+            context_list = [price_ctx] + context_list
+            has_price_context = True
+
         history_payload = [
             {"role": m.role, "content": m.content}
             for m in (req.history or [])
             if m.content and m.role in ("user", "assistant")
         ]
-        answer = generate_answer(req.question, context_list, history=history_payload)
+        answer = generate_answer(
+            req.question,
+            context_list,
+            history=history_payload,
+            system_prompt=PRICE_SYSTEM_PROMPT if has_price_context else None,
+            user_template=PRICE_USER_PROMPT_TEMPLATE if has_price_context else None,
+        )
         sources = [
             {
                 "rank": c.get("rank"),
@@ -180,6 +236,7 @@ def ask(req: AskRequest):
             sources=sources,
             has_context=len(context_list) > 0,
             collection_name=context_list[0].get("collection_name") if context_list else None,
+            price_data=price_data,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -187,11 +244,47 @@ def ask(req: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _format_price_as_context(price_data: dict[str, Any]) -> dict[str, Any]:
+    """Turn structured price_data into a RAG context entry the LLM can cite."""
+    drug = price_data.get("drug_name", "")
+    lines = [f"KẾT QUẢ TRA CỨU GIÁ THUỐC: {drug}"]
+
+    if price_data.get("is_prescription"):
+        lines.append("Đây là thuốc kê đơn (Rx).")
+        lines.append(price_data.get("notes", "Giá thuốc kê đơn không niêm yết công khai."))
+    else:
+        price_range = price_data.get("price_range", "")
+        if price_range:
+            lines.append(f"Khoảng giá: {price_range}")
+        for p in price_data.get("prices", []):
+            name = p.get("source_name", "Nhà thuốc")
+            price = p.get("price", "N/A")
+            unit = p.get("unit", "")
+            url = p.get("source_url", "")
+            lines.append(f"  • {name}: {price}/{unit} — {url}")
+
+    urls = price_data.get("source_urls", [])
+    if urls:
+        lines.append("Nguồn: " + ", ".join(urls[:3]))
+
+    disclaimer = price_data.get("disclaimer", "")
+    if disclaimer:
+        lines.append(disclaimer)
+
+    return {
+        "content": "\n".join(lines),
+        "source": "Tra cứu giá thuốc trực tuyến",
+        "summary": price_data.get("price_range", f"Giá thuốc {drug}"),
+        "collection_name": None,
+        "rank": 0,
+        "page": None,
+    }
+
+
 @app.post("/ingest-file", response_model=IngestResponse)
 async def ingest_file_endpoint(
     file: UploadFile = File(...),
     collection_name: str = Form("rag_chatbot"),
-    skip_metadata_llm: bool = Form(False),
 ):
     """Ingest a single uploaded file into the vector store."""
     settings = get_settings()
@@ -208,10 +301,13 @@ async def ingest_file_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
     try:
-        result = ingest_file(
-            target_path,
-            collection_name=collection_name,
-            skip_metadata_llm=skip_metadata_llm,
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: ingest_file(
+                target_path,
+                collection_name=collection_name,
+            ),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -331,8 +427,6 @@ def delete_document(req: DeleteDocumentRequest):
     parents_path = settings.persist_dir / f"{req.collection_name}_parents.json"
     if parents_path.exists():
         try:
-            import json
-
             with open(parents_path, "r", encoding="utf-8") as f:
                 parents = json.load(f)
             parents = {
@@ -371,6 +465,24 @@ def delete_collection(collection_name: str):
                 pass
 
     return {"message": f"Deleted collection '{collection_name}' and related metadata."}
+
+
+# --- Drug price lookup ---
+
+class DrugPriceRequest(BaseModel):
+    drug_name: str
+
+
+@app.post("/drug-price")
+def drug_price(req: DrugPriceRequest):
+    """Look up real-time retail prices for a medicine in Vietnam."""
+    if not req.drug_name.strip():
+        raise HTTPException(status_code=400, detail="drug_name is required")
+    try:
+        result = get_vietnam_drug_price(req.drug_name.strip())
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Feedback storage ---
