@@ -121,6 +121,119 @@ a {
   overflow: hidden;
 }
 
+.landing-main {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.landing-hero {
+  max-width: 640px;
+  text-align: center;
+  background: #ffffff;
+  padding: 2.5rem 2rem 2rem;
+  border-radius: 16px;
+  box-shadow: 0 14px 45px rgba(15, 23, 42, 0.16);
+}
+
+.landing-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin-bottom: 0.75rem;
+  color: #0f172a;
+}
+
+.landing-subtitle {
+  font-size: 0.95rem;
+  color: #4b5563;
+  margin-bottom: 1.5rem;
+}
+
+.landing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.landing-note {
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.landing-hero--auth {
+  max-width: 520px;
+}
+
+.landing-tabs {
+  display: inline-flex;
+  padding: 0.25rem;
+  border-radius: 999px;
+  background: #eef2ff;
+  margin-bottom: 1.25rem;
+}
+
+.landing-tab {
+  border: none;
+  background: transparent;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: #4b5563;
+  padding: 0.4rem 1.1rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.landing-tab.active {
+  background: #ffffff;
+  color: #1d4ed8;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.18);
+}
+
+.landing-form {
+  text-align: left;
+  margin: 0 auto 0.75rem;
+  max-width: 360px;
+}
+
+.landing-field {
+  margin-bottom: 0.75rem;
+}
+
+.landing-label {
+  font-size: 0.8rem;
+  color: #4b5563;
+  margin-bottom: 0.25rem;
+  display: block;
+}
+
+.landing-input {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  font-size: 0.85rem;
+}
+
+.landing-input:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.25);
+}
+
+.landing-error {
+  font-size: 0.8rem;
+  color: #b91c1c;
+  margin-bottom: 0.5rem;
+}
+
+.landing-submit {
+  margin-top: 0.25rem;
+}
+
 .sidebar {
   position: absolute;
   top: 0;
@@ -428,6 +541,7 @@ button {
 
 /* ----- Admin panel ----- */
 .main-panel--admin {
+  left: 0;
   overflow-y: auto;
   padding: 1rem 1.4rem 1.2rem;
 }
@@ -1634,3 +1748,94 @@ select.admin-input {
   line-height: 1.4;
 }
 
+
+/* ----- Account Page ----- */
+.account-page {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  background: #f5f7fb;
+  overflow-y: auto;
+}
+
+.account-container {
+  max-width: 480px;
+  width: 100%;
+  background: #ffffff;
+  padding: 2.5rem 2.5rem;
+  border-radius: 16px;
+  box-shadow: 0 10px 40px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.account-container h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.account-info {
+  margin-top: 0.5rem;
+  font-size: 0.95rem;
+  color: #4b5563;
+}
+
+.password-form {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.password-form h3 {
+  margin: 0;
+  font-size: 1.15rem;
+  color: #1e293b;
+  font-weight: 600;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 0.5rem;
+}
+
+.password-form .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.password-form label {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: #334155;
+  margin: 0;
+}
+
+.password-form input {
+  padding: 0.65rem 0.8rem;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  font-size: 0.95rem;
+  transition: all 0.2s;
+}
+
+.password-form input:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+.password-form .btn-primary {
+  margin-top: 0.5rem;
+  padding: 0.75rem;
+  font-size: 1rem;
+  border-radius: 8px;
+}
+
+.account-actions {
+  display: flex;
+  justify-content: center;
+}

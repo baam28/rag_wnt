@@ -18,6 +18,10 @@ eggs/
 *.egg-info/
 *.egg
 
+# Node
+node_modules/
+frontend/dist/
+
 # IDE
 .idea/
 .vscode/

@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -10,42 +11,22 @@ from typing import Any, Callable, Optional
 import tiktoken
 from docling.document_converter import DocumentConverter  # type: ignore[import-untyped]
 from langchain_core.documents import Document
-from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from config import get_settings
+from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
+
+_ingest_logger = logging.getLogger(__name__)
 
 TABLE_START = "<!--TABLE_START-->"
 TABLE_END = "<!--TABLE_END-->"
 
 
-def _fix_position_ids(model) -> None:
-    """Repair corrupted ``position_ids`` buffers after model load.
-
-    ``transformers >= 5`` lazy-materialises weights which can leave
-    ``persistent=False`` buffers (like ``position_ids``) filled with
-    uninitialised memory.  Re-creating the buffer with ``torch.arange``
-    restores the correct values.
-    """
-    import torch
-
-    for module in model.modules():
-        if hasattr(module, "position_ids") and isinstance(module.position_ids, torch.Tensor):
-            n = module.position_ids.size(0)
-            module.register_buffer(
-                "position_ids", torch.arange(n, dtype=torch.long), persistent=False,
-            )
-
-
 # --- Sparse vector helpers (for Qdrant native sparse) ---
-
-def _tokenize_for_sparse(text: str) -> list[str]:
-    """Tokenize for sparse vector (Vietnamese and English)."""
-    text = text.lower().strip()
-    return re.findall(r"\b\w+\b", text)
 
 
 def _build_vocab(texts: list[str], max_vocab_size: int = 100_000) -> dict[str, int]:
@@ -380,48 +361,43 @@ def semantic_parent_chunks(
     embeddings: Any,
 ) -> list[Document]:
     """
-    Use SemanticChunker to get semantic boundaries, then merge into parent-sized chunks.
-    Large documents are pre-split into sections to prevent timeout.
+    Split markdown documents by their headers, then recursively character split
+    any remaining overly long sections to fit the target token limit.
+    This replaces the expensive SemanticChunker.
     """
-    semantic = SemanticChunker(embeddings=embeddings)
-    all_splits: list[Document] = []
-    for doc in documents:
-        sections = _presplit_large_doc(doc)
-        for section in sections:
-            splits = semantic.split_documents([section])
-            all_splits.extend(splits)
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+    markdown_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=headers_to_split_on,
+        strip_headers=False,
+    )
+    
+    char_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=parent_target_tokens * 4,  # Approx 4 chars per token
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ".", " ", ""],
+    )
 
     parents: list[Document] = []
-    current_text: list[str] = []
-    current_tokens = 0
-    current_metadata: dict = {}
+    for doc in documents:
+        text = doc.page_content or ""
+        md_splits = markdown_splitter.split_text(text)
+        
+        for md_split in md_splits:
+            # Reattach original file-level metadata to the markdown sections
+            merged_metadata = {**doc.metadata, **md_split.metadata}
+            md_split.metadata = merged_metadata
+            
+            # If the md section is still too big, recursive character split it
+            if count_tokens(md_split.page_content) > parent_target_tokens:
+                sub_splits = char_splitter.split_documents([md_split])
+                parents.extend(sub_splits)
+            else:
+                parents.append(md_split)
 
-    for d in all_splits:
-        t = d.page_content.strip()
-        if not t:
-            continue
-        n = count_tokens(t)
-        if current_tokens + n > parent_target_tokens and current_text:
-            parent_text = "\n\n".join(current_text)
-            parents.append(
-                Document(
-                    page_content=parent_text,
-                    metadata={**current_metadata, **d.metadata},
-                )
-            )
-            current_text = [t]
-            current_tokens = n
-            current_metadata = d.metadata
-        else:
-            current_text.append(t)
-            current_tokens += n
-            current_metadata = d.metadata
-
-    if current_text:
-        parent_text = "\n\n".join(current_text)
-        parents.append(
-            Document(page_content=parent_text, metadata=current_metadata)
-        )
     return parents
 
 
@@ -644,6 +620,12 @@ TARGET_QUESTION: <câu hỏi mẫu>"""
                 target_question = line.split(":", 1)[1].strip()
         return summary or content[:200], target_question or "Nội dung đoạn văn là gì?"
     except Exception:
+        _ingest_logger.warning(
+            "LLM failed to generate summary/target_question for chunk (source: %s). "
+            "Falling back to text truncation.",
+            parent.metadata.get("source", "unknown"),
+            exc_info=True,
+        )
         return parent.page_content[:200], "Nội dung đoạn văn là gì?"
 
 
@@ -666,13 +648,6 @@ def sanitize_collection_name(name: str) -> str:
         s = s + "1"
     return s[:63]
 
-
-def get_qdrant_client(persist_dir: Path) -> QdrantClient:
-    """Create or connect to local Qdrant under persist_dir."""
-    persist_dir.mkdir(parents=True, exist_ok=True)
-    path = persist_dir / "storage"
-    path.mkdir(parents=True, exist_ok=True)
-    return QdrantClient(path=str(path))
 
 
 def _ensure_collection(
@@ -786,10 +761,12 @@ def ingest_file(
     *,
     collection_name: str = "rag_chatbot",
     on_progress: Optional[Callable[[str, str, int, int], None]] = None,
+    skip_summary: bool = False,
 ) -> dict[str, Any]:
     """
     Load file, build parent/child chunks, add metadata, store in Qdrant.
     Returns dict with num_parents, num_children, etc. on_progress(step, msg, current, total) is optional.
+    If skip_summary is True, do not call LLM for summary/target_question (faster, uses truncation instead).
     """
     progress = on_progress or _noop_progress
     collection_name = sanitize_collection_name(collection_name)
@@ -844,7 +821,11 @@ def ingest_file(
         parent_id = hashlib.sha256(
             (parent.page_content + str(i)).encode()
         ).hexdigest()[:16]
-        summary, target_question = add_parent_metadata(parent, llm)
+        if skip_summary:
+            summary = (parent.page_content[:200] + "...") if len(parent.page_content) > 200 else parent.page_content
+            target_question = "Nội dung đoạn văn là gì?"
+        else:
+            summary, target_question = add_parent_metadata(parent, llm)
 
         parent_meta[parent_id] = {
             "content": parent.page_content,

@@ -1,9 +1,13 @@
 """Retrieval: query expansion, hybrid search (vector + Qdrant native sparse), re-ranking, parent context."""
 import json
+import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
 
+from cachetools import TTLCache
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
@@ -11,24 +15,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from config import get_settings
+from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
 
-
-def _fix_position_ids(model) -> None:
-    """Repair corrupted ``position_ids`` buffers after model load.
-
-    ``transformers >= 5`` lazy-materialises weights which can leave
-    ``persistent=False`` buffers (like ``position_ids``) filled with
-    uninitialised memory.  Re-creating the buffer with ``torch.arange``
-    restores the correct values.
-    """
-    import torch
-
-    for module in model.modules():
-        if hasattr(module, "position_ids") and isinstance(module.position_ids, torch.Tensor):
-            n = module.position_ids.size(0)
-            module.register_buffer(
-                "position_ids", torch.arange(n, dtype=torch.long), persistent=False,
-            )
+logger = logging.getLogger(__name__)
 
 
 # --- Query expansion ---
@@ -56,20 +45,52 @@ Câu hỏi gốc: {query}"""
         return [query]
 
 
+def reformulate_with_history(
+    question: str,
+    history: list[dict[str, str]],
+) -> str:
+    """Rewrite a follow-up question into a self-contained standalone query.
+
+    When the user asks "explain the second point in more detail" the retriever
+    has no idea what "the second point" refers to.  This function uses the
+    singleton LLM to fold the most recent chat context into the question so
+    that ``retrieve()`` can find the right documents.
+
+    Returns the original ``question`` unchanged if:
+    - ``history`` is empty (first turn — no reformulation needed)
+    - the LLM call fails for any reason (safe fallback)
+    """
+    if not history:
+        return question
+
+    # Use only the last 3 turns to keep the prompt short
+    recent = history[-6:]  # 3 user + 3 assistant turns at most
+    history_text = "\n".join(
+        f"{'Người dùng' if m['role'] == 'user' else 'Trợ lý'}: {m['content'][:400]}"
+        for m in recent
+        if m.get("content")
+    )
+
+    prompt = (
+        "Dựa vào lịch sử hội thoại bên dưới, hãy viết lại câu hỏi cuối cùng của người dùng "
+        "thành một câu hỏi độc lập, đầy đủ ý nghĩa (không cần lịch sử để hiểu). "
+        "Chỉ trả lời bằng câu hỏi được viết lại, không thêm giải thích.\n\n"
+        f"Lịch sử:\n{history_text}\n\n"
+        f"Câu hỏi cần viết lại: {question}"
+    )
+    try:
+        llm = get_llm()
+        resp = llm.invoke(prompt)
+        rewritten = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
+        if rewritten and len(rewritten) > 5:
+            logger.debug("Query reformulated: %r → %r", question, rewritten)
+            return rewritten
+    except Exception:
+        logger.warning("Query reformulation failed; using original question.", exc_info=True)
+    return question
+
+
 # --- Qdrant client & hybrid search ---
-
-def get_qdrant_client(persist_dir: Path) -> QdrantClient:
-    """Connect to local Qdrant (embedded) under persist_dir."""
-    persist_dir.mkdir(parents=True, exist_ok=True)
-    path = persist_dir / "storage"
-    path.mkdir(parents=True, exist_ok=True)
-    return QdrantClient(path=str(path))
-
-
-def _tokenize_for_sparse(text: str) -> list[str]:
-    """Tokenize for sparse vector (Vietnamese and English)."""
-    text = text.lower().strip()
-    return re.findall(r"\b\w+\b", text)
 
 
 def _query_to_sparse_vector(query: str, query_variations: list[str], vocab: dict[str, int]) -> qmodels.SparseVector | None:
@@ -161,14 +182,68 @@ def hybrid_search(
 # --- Re-ranking ---
 
 _reranker: Optional[CrossEncoder] = None
+_reranker_lock = threading.Lock()
 
 
 def get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is None:
-        settings = get_settings()
-        _reranker = CrossEncoder(settings.reranker_model)
+        with _reranker_lock:
+            if _reranker is None:  # double-checked locking
+                settings = get_settings()
+                _reranker = CrossEncoder(settings.reranker_model)
     return _reranker
+
+
+# ---------------------------------------------------------------------------
+# Singleton LLM & embeddings clients
+# ---------------------------------------------------------------------------
+
+_embeddings: Any = None
+_embeddings_lock = threading.Lock()
+_llm: Optional[ChatOpenAI] = None
+_llm_lock = threading.Lock()
+
+
+def get_embeddings():
+    """Return a process-wide singleton embedding client.
+
+    HuggingFace model loading takes 3-10 s; we only want to pay that cost once.
+    Thread-safe via double-checked locking.
+    """
+    global _embeddings
+    if _embeddings is None:
+        with _embeddings_lock:
+            if _embeddings is None:
+                settings = get_settings()
+                if settings.embedding_model.startswith("text-embedding"):
+                    _embeddings = OpenAIEmbeddings(
+                        model=settings.embedding_model,
+                        api_key=settings.openai_api_key,
+                    )
+                else:
+                    emb = HuggingFaceEmbeddings(
+                        model_name=settings.embedding_model,
+                        model_kwargs={"trust_remote_code": True, "device": "cpu"},
+                    )
+                    _fix_position_ids(emb.client)
+                    _embeddings = emb
+    return _embeddings
+
+
+def get_llm() -> ChatOpenAI:
+    """Return a process-wide singleton ChatOpenAI client for query expansion."""
+    global _llm
+    if _llm is None:
+        with _llm_lock:
+            if _llm is None:
+                settings = get_settings()
+                _llm = ChatOpenAI(
+                    model=settings.llm_model,
+                    api_key=settings.openai_api_key,
+                    temperature=0.1,
+                )
+    return _llm
 
 
 def rerank(
@@ -199,14 +274,35 @@ def rerank(
 
 # --- Parent context ---
 
+# Cache parent JSON files in memory for up to 5 minutes.
+# Each entry is keyed by (collection_name, file_mtime) so the cache
+# is automatically invalidated when the file is updated by a new ingest.
+_parents_cache: TTLCache = TTLCache(maxsize=32, ttl=300)
+_parents_cache_lock = threading.Lock()
+
+
 def load_parents(collection_name: str) -> dict[str, dict]:
-    """Load parent_id -> {content, summary, target_question, source} from JSON."""
+    """Load parent_id -> {content, summary, target_question, source} from JSON.
+
+    Results are cached in memory for up to 5 minutes and invalidated whenever
+    the underlying file changes (mtime-based key), so a new ingest is always
+    picked up within at most one cache period.
+    """
     settings = get_settings()
     path = settings.persist_dir / f"{collection_name}_parents.json"
     if not path.exists():
         return {}
+    mtime = path.stat().st_mtime
+    cache_key = (collection_name, mtime)
+    with _parents_cache_lock:
+        cached = _parents_cache.get(cache_key)
+        if cached is not None:
+            return cached
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    with _parents_cache_lock:
+        _parents_cache[cache_key] = data
+    return data
 
 
 def fetch_parent_context(
@@ -301,67 +397,82 @@ def _retrieve_single_collection(
 
 def retrieve(
     query: str,
-    collection_name: Optional[str] = None,
+    collections_to_search: list[str],
 ) -> list[dict[str, Any]]:
     """
-    Run full retrieval. If collection_name is given, query only that collection.
-    Otherwise, try all collections and return the one with the best score.
+    Run full retrieval using process-wide singleton clients.
+
+    Queries all collections in `collections_to_search` in parallel via a thread pool.
+    Gathers the top-K hybrid search results from each collection into a single pool,
+    then runs the cross-encoder re-ranker over the combined pool to find the global top-K.
     """
     settings = get_settings()
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is required.")
 
-    if settings.embedding_model.startswith("text-embedding"):
-        embeddings = OpenAIEmbeddings(
-            model=settings.embedding_model,
-            api_key=settings.openai_api_key,
-        )
-    else:
-        embeddings = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model,
-            model_kwargs={"trust_remote_code": True, "device": "cpu"},
-        )
-        _fix_position_ids(embeddings.client)
-    llm = ChatOpenAI(
-        model=settings.llm_model,
-        api_key=settings.openai_api_key,
-        temperature=0.1,
-    )
+    # Singletons: first call initialises; subsequent calls return instantly.
+    embeddings = get_embeddings()
+    llm = get_llm()
     client = get_qdrant_client(settings.persist_dir)
 
-    if collection_name:
-        return _retrieve_single_collection(
-            query=query,
-            collection_name=collection_name,
-            embeddings=embeddings,
-            llm=llm,
-            client=client,
-            settings=settings,
-        )
-
-    try:
-        collections_response = client.get_collections()
-        collections = [c.name for c in collections_response.collections]
-    except Exception:
+    if not collections_to_search:
         return []
 
-    best_context: list[dict[str, Any]] = []
-    best_score: float = float("-inf")
+    # Parallel hybrid search: get un-ranked candidates from each collection
+    def _hybrid_search_one(coll_name: str) -> list[tuple[str, dict, float, str]]:
+        try:
+            variations = expand_query(query, llm, num_variations=settings.query_expansion_count)
+            candidates = hybrid_search(
+                query, variations, embeddings, client, coll_name,
+                persist_dir=settings.persist_dir, top_k=settings.hybrid_top_k
+            )
+            # Tag each candidate with its origin collection
+            return [(doc_id, meta, score, coll_name) for (doc_id, meta, score) in candidates]
+        except ValueError as e:
+            if "not found" in str(e).lower():
+                logger.debug("Collection '%s' does not exist yet.", coll_name)
+            else:
+                logger.warning("Hybrid search ValueError for collection '%s': %s", coll_name, e)
+            return []
+        except Exception:
+            logger.warning("Hybrid search failed for collection '%s'.", coll_name, exc_info=False)
+            return []
 
-    for name in collections:
-        ctx = _retrieve_single_collection(
-            query=query,
-            collection_name=name,
-            embeddings=embeddings,
-            llm=llm,
-            client=client,
-            settings=settings,
-        )
-        if not ctx:
-            continue
-        top_score = ctx[0].get("score", 0.0)
-        if top_score > best_score:
-            best_score = top_score
-            best_context = ctx
+    combined_candidates: list[tuple[str, dict, float, str]] = []
+    with ThreadPoolExecutor(max_workers=min(len(collections_to_search), 4)) as pool:
+        futures = {pool.submit(_hybrid_search_one, name): name for name in collections_to_search}
+        for future in as_completed(futures):
+            combined_candidates.extend(future.result())
 
-    return best_context
+    if not combined_candidates:
+        return []
+
+    # Unified cross-encoder re-ranking over the combined candidate pool
+    # Strip the collection name temporarily for the rerank function signature
+    candidates_for_rerank = [(doc_id, meta, score) for doc_id, meta, score, _ in combined_candidates]
+    all_ids = [c[0] for c in combined_candidates]
+    all_docs = [(c[1].get("text", "") or "") for c in combined_candidates]
+
+    top_k = rerank(
+        query,
+        candidates_for_rerank,
+        all_docs,
+        all_ids,
+        top_k=settings.rerank_top_k,
+    )
+
+    # Re-attach collection names and fetch parent contexts
+    final_context_list = []
+    for rank, (doc_id, meta, score) in enumerate(top_k, 1):
+        # find original collection name
+        coll_name = next(orig_c for orig_id, _, _, orig_c in combined_candidates if orig_id == doc_id)
+        
+        # We fetch the parent block for this chunk
+        parent_contexts = fetch_parent_context([(doc_id, meta, score)], collection_name=coll_name)
+        if parent_contexts:
+            ctx = parent_contexts[0]
+            ctx["collection_name"] = coll_name
+            ctx["rank"] = rank
+            final_context_list.append(ctx)
+
+    return final_context_list

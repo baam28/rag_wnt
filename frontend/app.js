@@ -1,21 +1,9 @@
-const { useState, useEffect } = React;
+import React, { useState, useEffect, useRef } from 'react';
+import LandingPage from './landing.js';
+import ChatPage from './chat_page.js';
+import AdminPage from './admin_page.js';
 
-const API_BASE = ""; // same origin, e.g. http://localhost:8000
-
-function formatDateLabel(iso) {
-  if (!iso) return "";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString("vi-VN", {
-      day: "2-digit",
-      month: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
-}
+const API_BASE = ""; // same origin
 
 function loadSessionsFromStorage() {
   try {
@@ -34,7 +22,24 @@ function saveSessionsToStorage(list) {
   }
 }
 
+function getStoredToken() {
+  try {
+    return window.localStorage.getItem("rag_jwt") || null;
+  } catch {
+    return null;
+  }
+}
+
 function App() {
+  const [jwtToken, setJwtToken] = useState(() => getStoredToken());
+  const [username, setUsername] = useState("");
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [route, setRoute] = useState(() => {
+    const path = window.location.pathname;
+    if (path.startsWith("/admin")) return "admin";
+    return "chat";
+  });
+
   const [sessions, setSessions] = useState(() => loadSessionsFromStorage());
   const [activeSessionId, setActiveSessionId] = useState(
     () => (loadSessionsFromStorage()[0]?.id) || null
@@ -43,24 +48,25 @@ function App() {
     const first = loadSessionsFromStorage()[0];
     return first?.messages || [];
   });
-
   const [question, setQuestion] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [askError, setAskError] = useState("");
 
+  // Admin state
   const [uploadFile, setUploadFile] = useState(null);
   const [collectionName, setCollectionName] = useState("");
   const [newCollectionMode, setNewCollectionMode] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
   const [ingestStatus, setIngestStatus] = useState("");
   const [isIngesting, setIsIngesting] = useState(false);
+  const [ingestProgress, setIngestProgress] = useState(null);
+  const [currentJobId, setCurrentJobId] = useState(null);
+  const [skipSummary, setSkipSummary] = useState(false);
+  const ingestPollRef = useRef(null);
 
   const [isClearingDb, setIsClearingDb] = useState(false);
   const [clearDbStatus, setClearDbStatus] = useState("");
 
-  const [activePage, setActivePage] = useState("user"); // 'user' | 'admin'
-
-  // Admin state
   const [collections, setCollections] = useState([]);
   const [collectionsLoading, setCollectionsLoading] = useState(false);
   const [collectionsError, setCollectionsError] = useState("");
@@ -69,15 +75,166 @@ function App() {
   const [docsLoading, setDocsLoading] = useState(false);
   const [docsError, setDocsError] = useState("");
 
-  // Feedback analytics state
   const [feedbackData, setFeedbackData] = useState(null);
   const [feedbackLoading, setFeedbackLoading] = useState(false);
-  const [feedbackTab, setFeedbackTab] = useState("down"); // "down" | "all"
+  const [feedbackTab, setFeedbackTab] = useState("down");
+
+  function syncUserFromToken(token) {
+    if (!token) {
+      setIsAdmin(false);
+      setUsername("");
+      return;
+    }
+    try {
+      const payload = JSON.parse(atob(token.split(".")[1]));
+      setIsAdmin(!!payload.admin);
+      setUsername(payload.email || payload.username || "");
+    } catch {
+      setIsAdmin(false);
+      setUsername("");
+    }
+  }
+
+  useEffect(() => {
+    syncUserFromToken(jwtToken);
+  }, [jwtToken]);
+
+  useEffect(() => {
+    if (!jwtToken) return;
+    (async () => {
+      try {
+        const resp = await authFetch(`${API_BASE}/chat/sessions`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        setSessions(
+          data.map((s) => ({
+            id: s.id,
+            title: s.title,
+            createdAt: s.created_at,
+            updatedAt: s.updated_at,
+            messages: [],
+          }))
+        );
+        if (data.length > 0) {
+          const firstId = data[0].id;
+          setActiveSessionId(firstId);
+          const mResp = await authFetch(
+            `${API_BASE}/chat/sessions/${firstId}/messages`
+          );
+          if (mResp.ok) {
+            const msgs = await mResp.json();
+            const fetchedMessages = msgs.map((m) => ({ 
+              role: m.role, 
+              content: m.content,
+              sources: m.sources,
+              priceData: m.priceData,
+              feedback: m.feedback,
+              feedbackComment: m.feedbackComment
+            }));
+            setMessages(fetchedMessages);
+            setSessions(prev => 
+              prev.map(s => s.id === firstId ? { ...s, messages: fetchedMessages } : s)
+            );
+          }
+        } else {
+          setActiveSessionId(null);
+          setMessages([]);
+        }
+      } catch (e) {
+        console.error("Load server sessions error", e);
+      }
+    })();
+  }, [jwtToken]);
+
+  useEffect(() => {
+    if (!jwtToken) {
+      saveSessionsToStorage(sessions);
+    }
+  }, [sessions, jwtToken]);
+
+  useEffect(() => {
+    // Resume ingest polling if there's a stored jobId
+    const storedJobId = window.localStorage.getItem("rag_ingest_job_id");
+    if (storedJobId) {
+      startIngestPolling(storedJobId);
+    }
+    return () => {
+      if (ingestPollRef.current) clearInterval(ingestPollRef.current);
+    };
+  }, []);
+
+  async function startIngestPolling(jobId) {
+    if (ingestPollRef.current) clearInterval(ingestPollRef.current);
+    setIsIngesting(true);
+    setCurrentJobId(jobId);
+    window.localStorage.setItem("rag_ingest_job_id", jobId);
+
+    const poll = async () => {
+      try {
+        const r = await authFetch(`${API_BASE}/ingest-jobs/${jobId}`);
+        if (!r.ok) {
+          if (r.status === 404) stopIngestPolling();
+          return;
+        }
+        const j = await r.json();
+        setIngestProgress({
+          phase: j.phase || j.status,
+          message: j.message || j.status,
+          current: j.current ?? 0,
+          total: j.total ?? 1,
+        });
+
+        if (j.status === "done") {
+          stopIngestPolling();
+          const res = j.result;
+          setIngestStatus(
+            `Đã ingest: ${res.num_parents} parent, ${res.num_children} child → collection ${res.collection_name}`
+          );
+          await fetchCollections();
+          setNewCollectionMode(false);
+          setNewCollectionName("");
+          setCollectionName(res.collection_name);
+        } else if (j.status === "error" || j.status === "cancelled") {
+          const statusMsg = j.status === "cancelled" ? "Đã hủy." : `Lỗi ingest: ${j.error || "Unknown"}`;
+          stopIngestPolling();
+          setIngestStatus(statusMsg);
+        }
+      } catch (e) {
+        console.error("Polling error:", e);
+      }
+    };
+
+    await poll();
+    ingestPollRef.current = setInterval(poll, 2000);
+  }
+
+  function stopIngestPolling() {
+    if (ingestPollRef.current) clearInterval(ingestPollRef.current);
+    ingestPollRef.current = null;
+    setIsIngesting(false);
+    setCurrentJobId(null);
+    setIngestProgress(null);
+    window.localStorage.removeItem("rag_ingest_job_id");
+  }
+
+  function authFetch(url, options = {}) {
+    const headers = options.headers ? { ...options.headers } : {};
+    if (jwtToken) {
+      headers["Authorization"] = `Bearer ${jwtToken}`;
+    }
+    return fetch(url, { ...options, headers }).then(async (resp) => {
+      if (resp.status === 401 || resp.status === 403) {
+        // token invalid -> logout
+        handleLogout();
+      }
+      return resp;
+    });
+  }
 
   async function fetchFeedback() {
     setFeedbackLoading(true);
     try {
-      const resp = await fetch(`${API_BASE}/admin/feedback`);
+      const resp = await authFetch(`${API_BASE}/admin/feedback`);
       if (!resp.ok) throw new Error("Failed to load feedback");
       const data = await resp.json();
       setFeedbackData(data);
@@ -87,11 +244,6 @@ function App() {
       setFeedbackLoading(false);
     }
   }
-
-  // Persist sessions whenever they change
-  useEffect(() => {
-    saveSessionsToStorage(sessions);
-  }, [sessions]);
 
   function ensureActiveSession() {
     if (activeSessionId) return activeSessionId;
@@ -110,9 +262,35 @@ function App() {
     return newId;
   }
 
-  function handleSelectSession(id) {
+  async function handleSelectSession(id) {
     const s = sessions.find((x) => x.id === id);
     setActiveSessionId(id);
+
+    if (jwtToken && s && s.messages.length === 0) {
+      try {
+        const mResp = await authFetch(`${API_BASE}/chat/sessions/${id}/messages`);
+        if (mResp.ok) {
+          const msgs = await mResp.json();
+          const fetchedMessages = msgs.map((m) => ({ 
+            role: m.role, 
+            content: m.content,
+            sources: m.sources,
+            priceData: m.priceData,
+            feedback: m.feedback,
+            feedbackComment: m.feedbackComment
+          }));
+          setMessages(fetchedMessages);
+          setSessions((prev) => 
+            prev.map((x) => (x.id === id ? { ...x, messages: fetchedMessages } : x))
+          );
+          setAskError("");
+          return;
+        }
+      } catch (err) {
+        console.error("Failed to fetch messages for session", id, err);
+      }
+    }
+
     setMessages(s?.messages || []);
     setAskError("");
   }
@@ -187,10 +365,14 @@ function App() {
         .slice(-8)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      const resp = await fetch(`${API_BASE}/ask`, {
+      const resp = await authFetch(`${API_BASE}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: userMsg.content, history }),
+        body: JSON.stringify({
+          question: userMsg.content,
+          history,
+          session_id: sid,
+        }),
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
@@ -248,49 +430,60 @@ function App() {
     });
   }
 
+  useEffect(() => {
+    return () => {
+      if (ingestPollRef.current) clearInterval(ingestPollRef.current);
+    };
+  }, []);
+
   async function handleIngest(e) {
     e.preventDefault();
     if (!uploadFile) {
       setIngestStatus("Chọn ít nhất một tệp để ingest.");
       return;
     }
-    const targetCollection = newCollectionMode
-      ? newCollectionName.trim()
-      : collectionName;
+    const targetCollection = collectionName || "drug";
     if (!targetCollection) {
       setIngestStatus("Vui lòng chọn hoặc tạo một collection.");
       return;
     }
     setIsIngesting(true);
-    setIngestStatus("Đang tải lên và xử lý...");
+    setIngestStatus("Đang tải lên...");
+    setIngestProgress({ phase: "upload", message: "Đang tải lên file...", current: 0, total: 1 });
     try {
       const form = new FormData();
       form.append("file", uploadFile);
       form.append("collection_name", targetCollection);
-      const resp = await fetch(`${API_BASE}/ingest-file`, {
+      form.append("skip_summary", skipSummary ? "true" : "false");
+      const resp = await authFetch(`${API_BASE}/ingest-file?async=true`, {
         method: "POST",
         body: form,
       });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || `Request failed with ${resp.status}`);
-      }
-      const data = await resp.json();
-      if (data.error) {
-        setIngestStatus(`Lỗi: ${data.error}`);
+      const data = await resp.json().catch(() => ({}));
+      if (resp.status === 202 && data.job_id) {
+        setIngestStatus("Đang xử lý (job chạy nền)...");
+        await startIngestPolling(data.job_id);
+      } else if (!resp.ok) {
+        throw new Error(data.detail || `Request failed with ${resp.status}`);
       } else {
-        setIngestStatus(
-          `Đã ingest: ${data.num_parents} parent, ${data.num_children} child → collection ${data.collection_name}`
-        );
-        await fetchCollections();
-        setNewCollectionMode(false);
-        setNewCollectionName("");
-        setCollectionName(data.collection_name || targetCollection);
+        if (data.error) {
+          setIngestStatus(`Lỗi: ${data.error}`);
+        } else {
+          setIngestStatus(
+            `Đã ingest: ${data.num_parents} parent, ${data.num_children} child → collection ${data.collection_name}`
+          );
+          await fetchCollections();
+          setNewCollectionMode(false);
+          setNewCollectionName("");
+          setCollectionName(data.collection_name || targetCollection);
+        }
+        setIngestProgress(null);
+        setIsIngesting(false);
       }
     } catch (err) {
       console.error(err);
       setIngestStatus(`Lỗi ingest: ${err}`);
-    } finally {
+      setIngestProgress(null);
       setIsIngesting(false);
     }
   }
@@ -303,13 +496,14 @@ function App() {
     setIsClearingDb(true);
     setClearDbStatus("");
     try {
-      const resp = await fetch(`${API_BASE}/db/clear`, { method: "POST" });
+      const resp = await authFetch(`${API_BASE}/db/clear`, { method: "POST" });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `Request failed with ${resp.status}`);
       }
       const data = await resp.json();
       setClearDbStatus(data.message || "Đã xóa database, hãy ingest lại tài liệu.");
+      await fetchCollections();
     } catch (err) {
       console.error(err);
       setClearDbStatus(`Lỗi: ${err}`);
@@ -322,15 +516,20 @@ function App() {
     setCollectionsLoading(true);
     setCollectionsError("");
     try {
-      const resp = await fetch(`${API_BASE}/admin/collections`);
+      const resp = await authFetch(`${API_BASE}/admin/collections`);
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `Request failed with ${resp.status}`);
       }
       const data = await resp.json();
       setCollections(data || []);
-      if (data && data.length > 0 && !collectionName && !newCollectionMode) {
-        setCollectionName(data[0].name);
+      if (data && data.length > 0) {
+        if (!collectionName && !newCollectionMode) {
+          setCollectionName(data[0].name);
+        }
+      } else {
+        // No collections: default to "create new" so the name input is visible
+        setNewCollectionMode(true);
       }
     } catch (err) {
       console.error(err);
@@ -348,7 +547,7 @@ function App() {
     setDocsLoading(true);
     setDocsError("");
     try {
-      const resp = await fetch(
+      const resp = await authFetch(
         `${API_BASE}/admin/docs?collection_name=${encodeURIComponent(
           collectionName
         )}`
@@ -376,7 +575,7 @@ function App() {
       return;
     }
     try {
-      const resp = await fetch(`${API_BASE}/admin/docs`, {
+      const resp = await authFetch(`${API_BASE}/admin/docs`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ collection_name: collectionName, source }),
@@ -401,7 +600,7 @@ function App() {
       return;
     }
     try {
-      const resp = await fetch(
+      const resp = await authFetch(
         `${API_BASE}/admin/collections/${encodeURIComponent(name)}`,
         { method: "DELETE" }
       );
@@ -420,58 +619,6 @@ function App() {
     }
   }
 
-  function renderSidebarSessions() {
-    return (
-      <div className="section-card">
-        <div className="section-title">Phiên trò chuyện</div>
-        <div className="section-caption">
-          Lưu và mở lại các phiên chat trước đó.
-        </div>
-        <div className="session-actions">
-          <button className="btn btn-ghost btn-sm" onClick={handleNewSession}>
-            + Phiên mới
-          </button>
-          <span className="badge-small">
-            {sessions.length ? `${sessions.length} phiên` : "Chưa có phiên"}
-          </span>
-        </div>
-        <div className="sessions-list">
-          {sessions.map((s) => (
-            <div
-              key={s.id}
-              className={
-                "session-item" + (s.id === activeSessionId ? " active" : "")
-              }
-              onClick={() => handleSelectSession(s.id)}
-            >
-              <div className="session-title-row">
-                <span className="session-title">{s.title}</span>
-                <button
-                  type="button"
-                  className="btn btn-ghost btn-sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDeleteSession(s.id);
-                  }}
-                >
-                  ✕
-                </button>
-              </div>
-              <div className="session-meta">
-                {formatDateLabel(s.updatedAt || s.createdAt)}
-              </div>
-            </div>
-          ))}
-          {!sessions.length && (
-            <div className="session-meta" style={{ marginTop: "0.25rem" }}>
-              Chưa có lịch sử. Hãy bắt đầu 1 câu hỏi mới.
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
   function handleFeedback(msgIdx, rating, comment) {
     const msg = messages[msgIdx];
     if (!msg || msg.role !== "assistant") return;
@@ -481,7 +628,7 @@ function App() {
     );
     updateActiveSessionMessages(activeSessionId, updated);
 
-    fetch(`${API_BASE}/feedback`, {
+    authFetch(`${API_BASE}/feedback`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -494,21 +641,31 @@ function App() {
     }).catch((err) => console.error("Feedback submit error:", err));
   }
 
-  function renderMessages() {
-    if (!messages.length) {
-      return (
-        <div className="status-text">
-          Hãy đặt câu hỏi đầu tiên của bạn về tài liệu.
-        </div>
-      );
+  function handleLoginSuccess(token, info) {
+    setJwtToken(token);
+    syncUserFromToken(token);
+    const newIsAdmin = info ? info.is_admin : false;
+    const dest = newIsAdmin ? "admin" : "chat";
+    setRoute(dest);
+    const path = dest === "admin" ? "/admin/" : "/app/";
+    if (!window.location.pathname.startsWith(path.slice(0, -1))) {
+      window.history.replaceState(null, "", path);
     }
-    return messages.map((m, idx) => (
-      <MessageBubble
-        key={idx}
-        message={m}
-        onFeedback={(rating, comment) => handleFeedback(idx, rating, comment)}
-      />
-    ));
+  }
+
+  function handleLogout() {
+    setJwtToken(null);
+    setIsAdmin(false);
+    setUsername("");
+    try {
+      window.localStorage.removeItem("rag_jwt");
+    } catch {
+      // ignore
+    }
+    setRoute("chat");
+    if (!window.location.pathname.startsWith("/app")) {
+      window.history.replaceState(null, "", "/app/");
+    }
   }
 
   return (
@@ -524,392 +681,153 @@ function App() {
           </div>
         </div>
         <div className="top-nav-right">
-          <button
-            className={
-              "btn btn-ghost btn-sm" +
-              (activePage === "user" ? " pill" : "")
-            }
-            onClick={() => setActivePage("user")}
-          >
-            Người dùng
-          </button>
-          <button
-            className={
-              "btn btn-ghost btn-sm" +
-              (activePage === "admin" ? " pill" : "")
-            }
-            onClick={() => {
-              setActivePage("admin");
-              fetchCollections();
-            }}
-          >
-            Admin
-          </button>
+          {jwtToken && !isAdmin && (
+            <>
+            </>
+          )}
+          {!jwtToken ? null : (
+            <>
+              <span className="user-info" style={{ marginLeft: "0.5rem" }}>
+                <button
+                  className={"btn btn-ghost btn-sm" + (route === "account" ? " pill" : "")}
+                  type="button"
+                  onClick={() => {
+                    setRoute("account");
+                    if (!window.location.pathname.startsWith("/account")) {
+                      window.history.replaceState(null, "", "/account/");
+                    }
+                  }}
+                  title="Quản lý tài khoản"
+                >
+                  {username}
+                </button>
+              </span>
+              <button
+                className="btn btn-ghost btn-sm"
+                type="button"
+                onClick={handleLogout}
+                style={{ marginLeft: "0.5rem" }}
+                title="Đăng xuất"
+              >
+                Đăng xuất
+              </button>
+            </>
+          )}
         </div>
       </header>
 
       <main className="layout-main">
-        {activePage === "user" ? (
-          <>
-            <aside className="sidebar">{renderSidebarSessions()}</aside>
-
-              <section className="main-panel">
-              <div className="chat-card">
-                <div className="chat-header">
-                  <div>
-                    <div className="chat-header-title">Chatbot</div>
-                  </div>
-                  <div className="badge-small">
-                    {activeSessionId
-                      ? `Phiên: ${activeSessionId.slice(0, 6)}…`
-                      : "Chưa có phiên"}
-                  </div>
-                </div>
-
-                <div className="chat-body">{renderMessages()}</div>
-
-                <form className="chat-footer" onSubmit={handleSend}>
-                  <input
-                    className="chat-input"
-                    placeholder="Nhập câu hỏi ..."
-                    value={question}
-                    onChange={(e) => setQuestion(e.target.value)}
-                    disabled={isSending}
-                  />
-                  <button
-                    type="submit"
-                    className="btn btn-primary"
-                    disabled={isSending || !question.trim()}
-                  >
-                    {isSending ? "Đang trả lời..." : "Gửi"}
-                  </button>
-                </form>
-                {askError && (
-                  <div style={{ padding: "0 0.9rem 0.5rem" }}>
-                    <div className="error-text">{askError}</div>
-                  </div>
-                )}
-              </div>
-            </section>
-          </>
+        {!jwtToken ? (
+          <LandingPage onLoggedIn={handleLoginSuccess} />
+        ) : route === "account" ? (
+          <UserAccountPage username={username} onLogout={handleLogout} onBack={() => {
+            const dest = isAdmin ? "admin" : "chat";
+            setRoute(dest);
+            const path = dest === "admin" ? "/admin/" : "/app/";
+            if (!window.location.pathname.startsWith(path.slice(0, -1))) {
+              window.history.replaceState(null, "", path);
+            }
+          }} />
+        ) : route === "admin" && isAdmin ? (
+          <AdminPage
+            state={{
+              collections,
+              collectionsLoading,
+              collectionsError,
+              selectedCollection,
+              docs,
+              docsLoading,
+              docsError,
+              uploadFile,
+              collectionName,
+              newCollectionMode,
+              newCollectionName,
+              skipSummary,
+              ingestStatus,
+              ingestProgress,
+              isIngesting,
+              currentJobId,
+              isClearingDb,
+              clearDbStatus,
+              feedbackData,
+              feedbackLoading,
+              feedbackTab,
+            }}
+            handlers={{
+              setUploadFile,
+              setCollectionName,
+              setNewCollectionMode,
+              setNewCollectionName,
+              setSkipSummary,
+              setSelectedCollection,
+              setFeedbackTab,
+              fetchCollections,
+              fetchDocs,
+              handleIngest,
+              handleClearDb,
+              handleDeleteCollection,
+              handleDeleteDoc,
+              fetchFeedback,
+              authFetch,
+            }}
+          />
+        ) : isAdmin ? (
+          <AdminPage
+            state={{
+              collections,
+              collectionsLoading,
+              collectionsError,
+              selectedCollection,
+              docs,
+              docsLoading,
+              docsError,
+              uploadFile,
+              collectionName,
+              newCollectionMode,
+              newCollectionName,
+              skipSummary,
+              ingestStatus,
+              ingestProgress,
+              isIngesting,
+              currentJobId,
+              isClearingDb,
+              clearDbStatus,
+              feedbackData,
+              feedbackLoading,
+              feedbackTab,
+            }}
+            handlers={{
+              setUploadFile,
+              setCollectionName,
+              setNewCollectionMode,
+              setNewCollectionName,
+              setSkipSummary,
+              setSelectedCollection,
+              setFeedbackTab,
+              fetchCollections,
+              fetchDocs,
+              handleIngest,
+              handleClearDb,
+              handleDeleteCollection,
+              handleDeleteDoc,
+              fetchFeedback,
+              authFetch,
+            }}
+          />
         ) : (
-          <>
-            <aside className="sidebar sidebar--admin">
-              <div className="admin-card">
-                <h2 className="admin-card-title">Bảng điều khiển Admin</h2>
-                <p className="admin-card-caption">
-                  Quản lý ingest tài liệu và cơ sở dữ liệu Qdrant.
-                </p>
-              </div>
-
-              <div className="admin-card">
-                <h2 className="admin-card-title">Ingest tài liệu</h2>
-                <p className="admin-card-caption">
-                  PDF / DOCX để tạo knowledge base.
-                </p>
-                <form className="admin-form" onSubmit={handleIngest}>
-                  <div className="admin-field">
-                    <label className="admin-label">Tệp tài liệu</label>
-                    <input
-                      type="file"
-                      accept=".pdf,.doc,.docx"
-                      className="admin-input"
-                      onChange={(e) =>
-                        setUploadFile(e.target.files[0] || null)
-                      }
-                    />
-                  </div>
-                  <div className="admin-field">
-                    <label className="admin-label">Collection</label>
-                    <select
-                      className="admin-input"
-                      value={newCollectionMode ? "__new__" : collectionName}
-                      onChange={(e) => {
-                        if (e.target.value === "__new__") {
-                          setNewCollectionMode(true);
-                          setCollectionName("");
-                        } else {
-                          setNewCollectionMode(false);
-                          setNewCollectionName("");
-                          setCollectionName(e.target.value);
-                        }
-                      }}
-                    >
-                      {collections.length === 0 && !newCollectionMode && (
-                        <option value="" disabled>-- Chưa có collection --</option>
-                      )}
-                      {collections.map((c) => (
-                        <option key={c.name} value={c.name}>{c.name}</option>
-                      ))}
-                      <option value="__new__">＋ Tạo collection mới</option>
-                    </select>
-                  </div>
-                  {newCollectionMode && (
-                    <div className="admin-field">
-                      <label className="admin-label">Tên collection mới</label>
-                      <input
-                        type="text"
-                        className="admin-input"
-                        value={newCollectionName}
-                        onChange={(e) => setNewCollectionName(e.target.value)}
-                        placeholder="vd: duoc_thu"
-                        autoFocus
-                      />
-                    </div>
-                  )}
-                  <div className="admin-actions">
-                    <button
-                      type="submit"
-                      className="btn btn-primary btn-full"
-                      disabled={isIngesting}
-                    >
-                      {isIngesting ? "Đang ingest..." : "Ingest tài liệu"}
-                    </button>
-                  </div>
-                  {ingestStatus && (
-                    <p className="admin-status">{ingestStatus}</p>
-                  )}
-                </form>
-              </div>
-            </aside>
-
-            <section className="main-panel main-panel--admin">
-              <div className="admin-card admin-card--db">
-                <div className="admin-row admin-row--head" style={{ marginBottom: "1rem" }}>
-                  <h2 className="admin-card-title" style={{ flex: 1 }}>Quản lý database</h2>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    type="button"
-                    onClick={fetchCollections}
-                  >
-                    Làm mới
-                  </button>
-                  <button
-                    className="btn btn-danger btn-sm"
-                    onClick={handleClearDb}
-                    disabled={isClearingDb}
-                  >
-                    {isClearingDb ? "Đang xóa..." : "Xóa toàn bộ DB"}
-                  </button>
-                </div>
-                {clearDbStatus && (
-                  <p className="admin-status" style={{ marginTop: 0, marginBottom: "0.5rem" }}>{clearDbStatus}</p>
-                )}
-                {collectionsLoading && (
-                  <p className="admin-status">Đang tải...</p>
-                )}
-                {collectionsError && (
-                  <p className="admin-error">{collectionsError}</p>
-                )}
-
-                <div className="admin-collection-list">
-                  {collections.map((c) => (
-                    <div key={c.name} className="admin-collection-group">
-                      <div
-                        className={
-                          "admin-collection-header" +
-                          (selectedCollection === c.name ? " active" : "")
-                        }
-                        onClick={() => {
-                          if (selectedCollection === c.name) {
-                            setSelectedCollection(null);
-                            setDocs([]);
-                          } else {
-                            setSelectedCollection(c.name);
-                            fetchDocs(c.name);
-                          }
-                        }}
-                      >
-                        <span className="admin-collection-arrow">
-                          {selectedCollection === c.name ? "▼" : "▶"}
-                        </span>
-                        <span className="admin-collection-name">{c.name}</span>
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteCollection(c.name);
-                          }}
-                        >
-                          Xóa
-                        </button>
-                      </div>
-
-                      {selectedCollection === c.name && (
-                        <div className="admin-collection-body">
-                          {docsLoading && (
-                            <p className="admin-status">Đang tải tài liệu...</p>
-                          )}
-                          {docsError && (
-                            <p className="admin-error">{docsError}</p>
-                          )}
-                          {!docsLoading && docs.length === 0 && (
-                            <p className="admin-status">Chưa có tài liệu nào.</p>
-                          )}
-                          {!docsLoading && docs.length > 0 && (
-                            <ul className="admin-doc-list">
-                              {docs.map((d) => (
-                                <li key={String(d.source)} className="admin-doc-item">
-                                  <span className="admin-doc-name" title={d.source}>
-                                    {d.source}
-                                  </span>
-                                  <span className="admin-doc-meta">
-                                    {d.parent_count ?? 0} chunk
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="btn btn-ghost btn-sm"
-                                    onClick={() => openDocument(d.source)}
-                                    title={`Xem "${d.source}"`}
-                                  >
-                                    Xem
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="btn btn-danger btn-sm"
-                                    onClick={() =>
-                                      handleDeleteDoc(selectedCollection, d.source)
-                                    }
-                                    title={`Xóa "${d.source}" khỏi collection`}
-                                  >
-                                    Xóa
-                                  </button>
-                                </li>
-                              ))}
-                            </ul>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                  {!collections.length && !collectionsLoading && (
-                    <p className="admin-empty">Chưa có collection nào.</p>
-                  )}
-                </div>
-              </div>
-
-              <div className="admin-card admin-card--feedback">
-                <div className="admin-row admin-row--head" style={{ marginBottom: "1rem" }}>
-                  <h2 className="admin-card-title" style={{ flex: 1 }}>Đánh giá người dùng</h2>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    type="button"
-                    onClick={fetchFeedback}
-                  >
-                    {feedbackLoading ? "Đang tải..." : "Tải dữ liệu"}
-                  </button>
-                </div>
-
-                {feedbackData && (
-                  <>
-                    <div className="feedback-stats">
-                      <div className="feedback-stat-card feedback-stat--total">
-                        <div className="feedback-stat-number">{feedbackData.total}</div>
-                        <div className="feedback-stat-label">Tổng đánh giá</div>
-                      </div>
-                      <div className="feedback-stat-card feedback-stat--up">
-                        <div className="feedback-stat-number">{feedbackData.up}</div>
-                        <div className="feedback-stat-label">Hữu ích</div>
-                      </div>
-                      <div className="feedback-stat-card feedback-stat--down">
-                        <div className="feedback-stat-number">{feedbackData.down}</div>
-                        <div className="feedback-stat-label">Chưa tốt</div>
-                      </div>
-                      <div className="feedback-stat-card feedback-stat--rate">
-                        <div className="feedback-stat-number">
-                          {feedbackData.total > 0
-                            ? Math.round((feedbackData.up / feedbackData.total) * 100) + "%"
-                            : "—"}
-                        </div>
-                        <div className="feedback-stat-label">Tỉ lệ tốt</div>
-                      </div>
-                    </div>
-
-                    <div className="feedback-tabs">
-                      <button
-                        className={"feedback-tab" + (feedbackTab === "down" ? " active" : "")}
-                        onClick={() => setFeedbackTab("down")}
-                      >
-                        Câu đánh giá thấp ({feedbackData.down})
-                      </button>
-                      <button
-                        className={"feedback-tab" + (feedbackTab === "all" ? " active" : "")}
-                        onClick={() => setFeedbackTab("all")}
-                      >
-                        Tất cả
-                      </button>
-                    </div>
-
-                    <div className="feedback-list">
-                      {feedbackTab === "down" && (
-                        feedbackData.down_entries.length === 0 ? (
-                          <p className="admin-status">Chưa có đánh giá chưa tốt nào.</p>
-                        ) : (
-                          feedbackData.down_entries.map((entry, i) => (
-                            <div key={i} className="feedback-entry feedback-entry--down">
-                              <div className="feedback-entry-header">
-                                <span className="feedback-entry-rating down">Chưa tốt</span>
-                                <span className="feedback-entry-time">{entry.timestamp}</span>
-                              </div>
-                              <div className="feedback-entry-qa">
-                                <div className="feedback-entry-q">
-                                  <strong>Câu hỏi:</strong> {entry.question}
-                                </div>
-                                <div className="feedback-entry-a">
-                                  <strong>Trả lời:</strong> {entry.answer || ""}
-                                </div>
-                              </div>
-                              {entry.comment && (
-                                <div className="feedback-entry-comment">
-                                  <strong>Góp ý:</strong> {entry.comment}
-                                </div>
-                              )}
-                            </div>
-                          ))
-                        )
-                      )}
-                      {feedbackTab === "all" && (
-                        feedbackData.all_entries.length === 0 ? (
-                          <p className="admin-status">Chưa có đánh giá nào.</p>
-                        ) : (
-                          feedbackData.all_entries.map((entry, i) => (
-                            <div key={i} className={"feedback-entry feedback-entry--" + entry.rating}>
-                              <div className="feedback-entry-header">
-                                <span className={"feedback-entry-rating " + entry.rating}>
-                                  {entry.rating === "up" ? "Hữu ích" : "Chưa tốt"}
-                                </span>
-                                <span className="feedback-entry-time">{entry.timestamp}</span>
-                              </div>
-                              <div className="feedback-entry-qa">
-                                <div className="feedback-entry-q">
-                                  <strong>Câu hỏi:</strong> {entry.question}
-                                </div>
-                                <div className="feedback-entry-a">
-                                  <strong>Trả lời:</strong> {entry.answer || ""}
-                                </div>
-                              </div>
-                              {entry.comment && (
-                                <div className="feedback-entry-comment">
-                                  <strong>Góp ý:</strong> {entry.comment}
-                                </div>
-                              )}
-                            </div>
-                          ))
-                        )
-                      )}
-                    </div>
-                  </>
-                )}
-
-                {!feedbackData && !feedbackLoading && (
-                  <p className="admin-status" style={{ textAlign: "center" }}>
-                    Nhấn "Tải dữ liệu" để xem thống kê đánh giá.
-                  </p>
-                )}
-              </div>
-            </section>
-          </>
+          <ChatPage
+            sessions={sessions}
+            activeSessionId={activeSessionId}
+            messages={messages}
+            onNewSession={handleNewSession}
+            onSelectSession={handleSelectSession}
+            onDeleteSession={handleDeleteSession}
+            onSend={handleSend}
+            question={question}
+            setQuestion={setQuestion}
+            isSending={isSending}
+            askError={askError}
+          />
         )}
       </main>
     </div>
@@ -990,7 +908,7 @@ function DocViewerModal({ source, contents, pages, onClose }) {
   );
 }
 
-function MessageBubble({ message, onFeedback }) {
+export function MessageBubble({ message, onFeedback }) {
   const [showSources, setShowSources] = useState(false);
   const [expandedSource, setExpandedSource] = useState(null);
   const [expandedDrugs, setExpandedDrugs] = useState(new Set());
@@ -1270,5 +1188,110 @@ function MessageBubble({ message, onFeedback }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+export { UserAccountPage };
+export default App;
+
+function UserAccountPage({ username, onLogout, onBack }) {
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  async function handleChangePassword(e) {
+    e.preventDefault();
+    if (!oldPassword || !newPassword) {
+      setError("Vui lòng nhập đầy đủ mật khẩu cũ và mới.");
+      return;
+    }
+    if (newPassword.length < 6) {
+      setError("Mật khẩu mới phải có ít nhất 6 ký tự.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+    setIsLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/auth/password`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${getStoredToken()}`,
+        },
+        body: JSON.stringify({
+          old_password: oldPassword,
+          new_password: newPassword,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || "Đổi mật khẩu thất bại");
+      }
+      setMessage("Đổi mật khẩu thành công!");
+      setOldPassword("");
+      setNewPassword("");
+    } catch (err) {
+      console.error(err);
+      setError(String(err.message));
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  return (
+    <div className="account-page">
+      <div className="account-container">
+        {onBack && (
+          <button 
+            type="button" 
+            className="btn btn-ghost btn-sm" 
+            onClick={onBack}
+            style={{ position: "absolute", top: "1.5rem", left: "1.5rem" }}
+          >
+            ❮ Chat
+          </button>
+        )}
+        <h2 style={{ textAlign: "center", marginTop: onBack ? "0.5rem" : "0" }}>Tài khoản của tôi</h2>
+        <div className="account-info" style={{ textAlign: "center", marginBottom: "0.5rem" }}>
+          <p><strong>Tên đăng nhập:</strong> {username}</p>
+        </div>
+
+        <form onSubmit={handleChangePassword} className="password-form">
+          <h3>Đổi mật khẩu</h3>
+          <div className="form-group">
+            <label>Mật khẩu hiện tại</label>
+            <input
+              type="password"
+              value={oldPassword}
+              onChange={(e) => setOldPassword(e.target.value)}
+              placeholder="Nhập mật khẩu hiện tại"
+            />
+          </div>
+          <div className="form-group">
+            <label>Mật khẩu mới</label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="Nhập mật khẩu mới (ít nhất 6 ký tự)"
+            />
+          </div>
+          {error && <div className="text-danger" style={{ fontSize: "0.85rem", marginTop: "-0.5rem" }}>{error}</div>}
+          {message && <div className="text-success" style={{ fontSize: "0.85rem", marginTop: "-0.5rem", color: "#16a34a" }}>{message}</div>}
+          
+          <button type="submit" className="btn btn-primary" disabled={isLoading}>
+            {isLoading ? "Đang xử lý..." : "Cập nhật mật khẩu"}
+          </button>
+        </form>
+
+        <div className="account-actions" style={{ marginTop: "2rem", paddingTop: "1.5rem", borderTop: "1px solid #e2e8f0" }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onLogout} style={{ color: "#ef4444", borderColor: "#fca5a5", backgroundColor: "#fef2f2" }}>
+            Đăng xuất
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
