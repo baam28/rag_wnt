@@ -1,4 +1,4 @@
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Tuple
 
 from langchain_openai import ChatOpenAI
 
@@ -64,23 +64,38 @@ def build_context_block(context_list: List[Dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+def _extract_usage(resp: Any) -> Dict[str, int]:
+    """Extract prompt_tokens and completion_tokens from LangChain OpenAI response."""
+    out = {"prompt_tokens": 0, "completion_tokens": 0}
+    try:
+        meta = getattr(resp, "response_metadata", None) or {}
+        usage = meta.get("usage_metadata") or meta.get("token_usage") or meta.get("usage")
+        if isinstance(usage, dict):
+            out["prompt_tokens"] = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+            out["completion_tokens"] = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    except Exception:
+        pass
+    return out
+
+
 def _generate_with_openai(
     query: str,
     context_list: List[Dict[str, Any]],
     history: Optional[List[Dict[str, str]]] = None,
     system_prompt: Optional[str] = None,
     user_template: Optional[str] = None,
-) -> str:
+) -> Tuple[str, Dict[str, int]]:
     """
     Generate answer from context using OpenAI.
-    history: optional list of {"role": "user"/"assistant", "content": "..."} for chat continuity.
+    Returns (content, usage_dict with prompt_tokens, completion_tokens).
     """
     settings = get_settings()
+    empty_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     if not settings.openai_api_key:
-        return "Lỗi: Chưa cấu hình OPENAI_API_KEY."
+        return "Lỗi: Chưa cấu hình OPENAI_API_KEY.", empty_usage
 
     if not context_list:
-        return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)"
+        return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)", empty_usage
 
     context_block = build_context_block(context_list)
     template = user_template or USER_PROMPT_TEMPLATE
@@ -104,9 +119,11 @@ def _generate_with_openai(
 
     try:
         resp = llm.invoke(messages)
-        return resp.content if hasattr(resp, "content") else str(resp)
+        content = resp.content if hasattr(resp, "content") else str(resp)
+        usage = _extract_usage(resp)
+        return content, usage
     except Exception as e:
-        return f"Lỗi khi tạo câu trả lời: {e}"
+        return f"Lỗi khi tạo câu trả lời: {e}", empty_usage
 
 
 def generate_answer(
@@ -115,8 +132,8 @@ def generate_answer(
     history: Optional[List[Dict[str, str]]] = None,
     system_prompt: Optional[str] = None,
     user_template: Optional[str] = None,
-) -> str:
-    """Return a grounded answer with citations (OpenAI), aware of prior chat history."""
+) -> Tuple[str, Dict[str, int]]:
+    """Return (grounded answer with citations, usage_dict)."""
     return _generate_with_openai(
         query, context_list, history=history,
         system_prompt=system_prompt, user_template=user_template,

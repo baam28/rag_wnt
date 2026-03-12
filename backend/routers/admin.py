@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from mongo_client import (
     get_chat_messages_collection,
 )
 from utils import get_qdrant_client
+from llm_usage import get_usage
 
 router = APIRouter(tags=["admin"])
 
@@ -53,6 +55,19 @@ def _load_feedback() -> list[dict]:
 def _save_feedback(data: list[dict]):
     with open(_FEEDBACK_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _last_n_dates(n: int = 30) -> list[str]:
+    """Return list of date strings YYYY-MM-DD for the last n days (oldest first)."""
+    utc = timezone.utc
+    today = datetime.now(utc).date()
+    return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n - 1, -1, -1)]
+
+
+def _fill_series_by_date(date_list: list[str], raw: list[dict], date_key: str = "date", count_key: str = "count") -> list[dict]:
+    """Merge raw [{ date, count }] into full date range; missing days get count 0."""
+    by_date = {d[date_key]: d.get(count_key, 0) for d in raw}
+    return [{"date": d, "count": by_date.get(d, 0)} for d in date_list]
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +117,72 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
     total_sessions = get_chat_sessions_collection().count_documents({})
     total_messages = get_chat_messages_collection().count_documents({})
     fb_data = _load_feedback()
+
+    date_list = _last_n_dates(30)
+
+    # Users per day
+    try:
+        raw = list(
+            get_users_collection().aggregate([
+                {"$project": {"day": {"$substr": ["$created_at", 0, 10]}}},
+                {"$group": {"_id": "$day", "count": {"$sum": 1}}},
+            ])
+        )
+        users_per_day = _fill_series_by_date(date_list, [{"date": d["_id"], "count": d["count"]} for d in raw])
+    except Exception:
+        users_per_day = [{"date": d, "count": 0} for d in date_list]
+
+    # Sessions (conversations) per day
+    try:
+        raw = list(
+            get_chat_sessions_collection().aggregate([
+                {"$project": {"day": {"$substr": ["$created_at", 0, 10]}}},
+                {"$group": {"_id": "$day", "count": {"$sum": 1}}},
+            ])
+        )
+        sessions_per_day = _fill_series_by_date(date_list, [{"date": d["_id"], "count": d["count"]} for d in raw])
+    except Exception:
+        sessions_per_day = [{"date": d, "count": 0} for d in date_list]
+
+    # Messages per day (assistant messages)
+    try:
+        raw = list(
+            get_chat_messages_collection().aggregate([
+                {"$match": {"role": "assistant"}},
+                {"$project": {"day": {"$substr": ["$created_at", 0, 10]}}},
+                {"$group": {"_id": "$day", "count": {"$sum": 1}}},
+            ])
+        )
+        messages_per_day = _fill_series_by_date(date_list, [{"date": d["_id"], "count": d["count"]} for d in raw])
+    except Exception:
+        messages_per_day = [{"date": d, "count": 0} for d in date_list]
+
+    # Feedback per day (from timestamp "YYYY-MM-DD HH:MM:SS")
+    fb_by_date: dict[str, int] = {}
+    for entry in fb_data:
+        ts = entry.get("timestamp", "")
+        day = ts[:10] if len(ts) >= 10 else ""
+        if day:
+            fb_by_date[day] = fb_by_date.get(day, 0) + 1
+    feedback_per_day = [{"date": d, "count": fb_by_date.get(d, 0)} for d in date_list]
+
+    # LLM API usage (total + daily, 30 days, normalized to same date range)
+    llm = get_usage(days=30)
+    daily_raw = {d["date"]: d for d in llm.get("daily", [])}
+    llm_daily_filled = []
+    for d in date_list:
+        item = daily_raw.get(d, {})
+        pt = item.get("prompt_tokens", 0)
+        ct = item.get("completion_tokens", 0)
+        llm_daily_filled.append({
+            "date": d,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "requests": item.get("requests", 0),
+            "count": pt + ct,
+        })
+    llm["daily"] = llm_daily_filled
+
     return {
         "total_users": total_users,
         "total_sessions": total_sessions,
@@ -111,6 +192,11 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
             "up": sum(1 for d in fb_data if d.get("rating") == "up"),
             "down": sum(1 for d in fb_data if d.get("rating") == "down"),
         },
+        "users_per_day": users_per_day,
+        "sessions_per_day": sessions_per_day,
+        "messages_per_day": messages_per_day,
+        "feedback_per_day": feedback_per_day,
+        "llm_usage": llm,
     }
 
 

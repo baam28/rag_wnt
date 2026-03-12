@@ -1388,6 +1388,107 @@ select.admin-input {
   color: #6b7280;
 }
 
+/* Admin analytics: clickable stat cards */
+.admin-stat-cards {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+@media (max-width: 720px) {
+  .admin-stat-cards {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.admin-stat-card {
+  background: #f8fafc;
+  border: 2px solid #e2e8f0;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.admin-stat-card:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+.admin-stat-card--selected {
+  border-color: #2563eb;
+  background: #eff6ff;
+  box-shadow: 0 0 0 1px #2563eb;
+}
+
+.admin-chart-subtitle {
+  font-size: 0.8125rem;
+  color: #64748b;
+  margin: -0.5rem 0 0.75rem 0;
+}
+
+.admin-recharts-wrap {
+  min-height: 280px;
+  width: 100%;
+}
+
+/* Admin analytics charts */
+.admin-chart-title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: #1f2937;
+  margin: 0 0 0.75rem 0;
+}
+
+.admin-chart-block {
+  padding: 0.5rem 0;
+}
+
+/* Line chart */
+.admin-line-chart-wrap {
+  width: 100%;
+  min-height: 140px;
+  padding: 0.5rem 0;
+}
+
+.admin-line-chart {
+  width: 100%;
+  height: 140px;
+  display: block;
+}
+
+.admin-line-chart--usage polyline,
+.admin-line-chart--usage circle {
+  stroke: #059669;
+  fill: #059669;
+}
+
+.admin-line-chart-labels {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 0.25rem;
+  padding: 0 0.5rem;
+}
+
+.admin-line-chart-labels .admin-chart-label {
+  flex: 1;
+  text-align: center;
+  font-size: 0.65rem;
+  color: #6b7280;
+  min-width: 0;
+}
+
+.admin-chart-label {
+  font-size: 0.65rem;
+  color: #6b7280;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.admin-chart-value {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #374151;
+}
+
 .feedback-tabs {
   display: flex;
   gap: 0;

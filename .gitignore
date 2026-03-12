@@ -34,6 +34,7 @@ qdrant_db/
 uploads/
 data/
 feedback.json
+llm_usage.json
 
 # Temp Office lock files
 ~$*

@@ -32,6 +32,7 @@ from prompts import (
 from supervisor import get_intent_from_supervisor
 from agents import run_price_agent, run_federated_rag_agent
 from drug_price_tool import get_vietnam_drug_price
+from llm_usage import record_usage
 
 router = APIRouter(tags=["chat"])
 
@@ -156,7 +157,8 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             system_prompt = None
             user_template = None
 
-        answer = generate_answer(req.question, final_contexts, history=history_payload, system_prompt=system_prompt, user_template=user_template)
+        answer, usage = generate_answer(req.question, final_contexts, history=history_payload, system_prompt=system_prompt, user_template=user_template)
+        record_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0))
         sources = [
             {
                 "rank": c.get("rank"),

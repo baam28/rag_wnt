@@ -1,4 +1,21 @@
 import React from 'react';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+} from 'recharts';
+
+const ANALYTICS_METRICS = [
+  { key: 'users', label: 'Tổng số User', dataKey: 'users_per_day', title: 'Số user theo ngày', color: '#2563eb' },
+  { key: 'sessions', label: 'Số cuộc hội thoại', dataKey: 'sessions_per_day', title: 'Số cuộc hội thoại theo ngày', color: '#16a34a' },
+  { key: 'messages', label: 'Tổng tin nhắn', dataKey: 'messages_per_day', title: 'Tin nhắn theo ngày', color: '#4f46e5' },
+  { key: 'feedback', label: 'Đánh giá thu thập được', dataKey: 'feedback_per_day', title: 'Đánh giá theo ngày', color: '#d97706' },
+  { key: 'api_usage', label: 'API usage (tokens)', dataKey: 'api_usage', title: 'API usage (tokens) theo ngày', color: '#0d9488' },
+];
 
 function AdminPage({
 
@@ -50,6 +67,7 @@ function AdminPage({
   const [activeTab, setActiveTab] = React.useState("analytics");
   const [analyticsData, setAnalyticsData] = React.useState(null);
   const [analyticsLoading, setAnalyticsLoading] = React.useState(false);
+  const [selectedMetric, setSelectedMetric] = React.useState('messages');
   const [users, setUsers] = React.useState([]);
   const [usersLoading, setUsersLoading] = React.useState(false);
 
@@ -138,28 +156,109 @@ function AdminPage({
         <div style={{ flex: 1, overflowY: "auto", paddingRight: "0.5rem", paddingBottom: "2rem" }}>
         
         {activeTab === "analytics" && (
-          <div className="admin-card">
-            <h2 className="admin-card-title" style={{ marginBottom: "1.5rem" }}>Thống kê tổng quan</h2>
-            {analyticsLoading ? <p className="admin-status">Đang tải...</p> : analyticsData ? (
-              <div className="feedback-stats">
-                <div className="feedback-stat-card feedback-stat--total">
-                  <div className="feedback-stat-number">{analyticsData.total_users}</div>
-                  <div className="feedback-stat-label">Tổng số User</div>
-                </div>
-                <div className="feedback-stat-card feedback-stat--up">
-                  <div className="feedback-stat-number">{analyticsData.total_sessions}</div>
-                  <div className="feedback-stat-label">Số cuộc hội thoại</div>
-                </div>
-                <div className="feedback-stat-card feedback-stat--down">
-                  <div className="feedback-stat-number">{analyticsData.total_messages}</div>
-                  <div className="feedback-stat-label">Tổng tin nhắn</div>
-                </div>
-                <div className="feedback-stat-card feedback-stat--rate">
-                  <div className="feedback-stat-number">{analyticsData.feedback.total}</div>
-                  <div className="feedback-stat-label">Đánh giá thu thập được</div>
-                </div>
+          <div className="admin-analytics">
+            <div className="admin-card">
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1.5rem", flexWrap: "wrap", gap: "0.5rem" }}>
+                <h2 className="admin-card-title" style={{ margin: 0 }}>Thống kê tổng quan</h2>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    setAnalyticsData(null);
+                    setAnalyticsLoading(true);
+                    authFetch("/admin/analytics").then((res) => res.json()).then((data) => { setAnalyticsData(data); setAnalyticsLoading(false); }).catch(() => setAnalyticsLoading(false));
+                  }}
+                  disabled={analyticsLoading}
+                >
+                  {analyticsLoading ? "Đang tải..." : "Làm mới"}
+                </button>
               </div>
-            ) : <p className="admin-status">Không có dữ liệu.</p>}
+              {analyticsLoading && !analyticsData ? <p className="admin-status">Đang tải...</p> : analyticsData ? (
+                <>
+                  <div className="feedback-stats admin-stat-cards">
+                    {ANALYTICS_METRICS.map((m) => {
+                      const total =
+                        m.key === 'users' ? analyticsData.total_users
+                        : m.key === 'sessions' ? analyticsData.total_sessions
+                        : m.key === 'messages' ? analyticsData.total_messages
+                        : m.key === 'feedback' ? (analyticsData.feedback?.total ?? 0)
+                        : (analyticsData.llm_usage?.total?.prompt_tokens ?? 0) + (analyticsData.llm_usage?.total?.completion_tokens ?? 0);
+                      const isSelected = selectedMetric === m.key;
+                      return (
+                        <button
+                          key={m.key}
+                          type="button"
+                          className={`feedback-stat-card admin-stat-card ${isSelected ? 'admin-stat-card--selected' : ''}`}
+                          style={{ cursor: 'pointer', textAlign: 'left', border: '2px solid transparent' }}
+                          onClick={() => setSelectedMetric(m.key)}
+                          aria-pressed={isSelected}
+                          aria-label={`${m.label}: ${total}. Nhấn để xem biểu đồ`}
+                        >
+                          <div className="feedback-stat-number">{typeof total === 'number' ? total.toLocaleString() : total}</div>
+                          <div className="feedback-stat-label">{m.label}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="admin-chart-area" style={{ marginTop: '1.5rem' }} aria-label={`Biểu đồ: ${ANALYTICS_METRICS.find((m) => m.key === selectedMetric)?.title ?? selectedMetric}`}>
+                    {(() => {
+                      const metric = ANALYTICS_METRICS.find((m) => m.key === selectedMetric);
+                      let chartData = [];
+                      let dataKey = 'count';
+                      if (metric) {
+                        if (metric.key === 'api_usage' && analyticsData.llm_usage?.daily) {
+                          chartData = analyticsData.llm_usage.daily.map((d) => ({ ...d, value: d.count ?? (d.prompt_tokens || 0) + (d.completion_tokens || 0) }));
+                          dataKey = 'value';
+                        } else {
+                          chartData = analyticsData[metric.dataKey] ?? [];
+                        }
+                      }
+                      const hasData = chartData.length > 0 && chartData.some((d) => (d[dataKey] ?? 0) > 0);
+                      if (!hasData) {
+                        return (
+                          <p className="admin-status" style={{ padding: '2rem 0' }}>
+                            Chưa có dữ liệu trong khoảng thời gian này.
+                          </p>
+                        );
+                      }
+                      return (
+                        <>
+                          <h3 className="admin-chart-title">{metric?.title}</h3>
+                          <p className="admin-chart-subtitle">30 ngày gần nhất</p>
+                          <div className="admin-recharts-wrap">
+                            <ResponsiveContainer width="100%" height={280}>
+                              <LineChart data={chartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                                <XAxis
+                                  dataKey="date"
+                                  tick={{ fontSize: 11, fill: '#6b7280' }}
+                                  tickFormatter={(v) => (v && v.length >= 10 ? v.slice(5) : v)}
+                                />
+                                <YAxis tick={{ fontSize: 11, fill: '#6b7280' }} allowDecimals={false} />
+                                <Tooltip
+                                  labelFormatter={(v) => v}
+                                  formatter={(val) => [typeof val === 'number' ? val.toLocaleString() : val, metric?.label]}
+                                  contentStyle={{ fontSize: '12px', borderRadius: '8px' }}
+                                />
+                                <Line
+                                  type="monotone"
+                                  dataKey={dataKey}
+                                  stroke={metric?.color ?? '#4f46e5'}
+                                  strokeWidth={2}
+                                  dot={{ r: 3, fill: metric?.color }}
+                                  activeDot={{ r: 5 }}
+                                />
+                              </LineChart>
+                            </ResponsiveContainer>
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </>
+              ) : <p className="admin-status">Không có dữ liệu.</p>}
+            </div>
           </div>
         )}
 
