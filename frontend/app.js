@@ -823,6 +823,7 @@ function App() {
             onSelectSession={handleSelectSession}
             onDeleteSession={handleDeleteSession}
             onSend={handleSend}
+            onFeedback={handleFeedback}
             question={question}
             setQuestion={setQuestion}
             isSending={isSending}

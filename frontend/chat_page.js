@@ -2,7 +2,6 @@ import React from 'react';
 import { MessageBubble } from './app.js';
 
 function ChatPage({
-
   sessions,
   activeSessionId,
   messages,
@@ -10,6 +9,7 @@ function ChatPage({
   onSelectSession,
   onDeleteSession,
   onSend,
+  onFeedback,
   question,
   setQuestion,
   isSending,
@@ -91,7 +91,11 @@ function ChatPage({
       );
     }
     return messages.map((m, idx) => (
-      <MessageBubble key={idx} message={m} onFeedback={() => {}} />
+      <MessageBubble
+        key={idx}
+        message={m}
+        onFeedback={onFeedback ? (rating, comment) => onFeedback(idx, rating, comment) : undefined}
+      />
     ));
   }
 
