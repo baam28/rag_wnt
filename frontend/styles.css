@@ -1720,14 +1720,15 @@ select.admin-input { cursor: pointer; appearance: auto; }
 .feedback-entry-comment { margin-top: .4rem; padding-top: .4rem; border-top: 1px dashed var(--c-border); color: var(--c-text-3); font-style: italic; }
 
 /* Price cards */
-.price-card { margin-top: .75rem; padding: .65rem .85rem; background: var(--c-success-l); border: 1px solid #a7f3d0; border-left: 4px solid var(--c-success); border-radius: var(--radius); font-size: .85rem; }
-.price-card--rx { background: var(--c-warning-l); border-color: #fcd34d; border-left-color: var(--c-warning); }
-.price-card-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .4rem; font-weight: 700; font-size: .875rem; color: #065f46; }
+.price-card { margin-top: .85rem; padding: .85rem .95rem; background: linear-gradient(180deg, #f8fafc 0%, #ecfdf5 100%); border: 1px solid #bae6d4; border-left: 4px solid var(--c-success); border-radius: 12px; font-size: .86rem; box-shadow: var(--shadow-xs); }
+.price-card--rx { background: linear-gradient(180deg, #fffbeb 0%, #fef3c7 100%); border-color: #fcd34d; border-left-color: var(--c-warning); }
+.price-card-header { display: flex; align-items: center; gap: .45rem; margin-bottom: .5rem; font-weight: 700; font-size: .9rem; color: #065f46; }
 .price-card--rx .price-card-header { color: #92400e; }
 .price-card-title { flex: 1; }
-.price-card-rx { display: inline-block; padding: .1rem .45rem; font-size: .68rem; font-weight: 700; color: #fff; background: var(--c-warning); border-radius: 4px; letter-spacing: .03em; }
-.price-card-range { padding: .35rem 0; font-weight: 700; color: var(--c-success); font-size: .9rem; }
-.price-card--rx .price-card-range { color: #b45309; font-weight: 500; }
+.price-card-rx { display: inline-block; padding: .15rem .55rem; font-size: .68rem; font-weight: 700; color: #fff; background: var(--c-warning); border-radius: var(--radius-full); letter-spacing: .03em; }
+.price-card-range { padding: .35rem 0; font-weight: 700; color: #065f46; font-size: .92rem; line-height: 1.45; }
+.price-card--rx .price-card-range { color: #92400e; font-weight: 600; }
+.price-card-source-line { margin-top: .2rem; font-size: .78rem; color: var(--c-text-3); }
 .price-card-list { display: flex; flex-direction: column; gap: .3rem; margin-top: .25rem; }
 .price-card-row { display: flex; align-items: center; gap: .5rem; padding: .3rem .5rem; background: rgba(255,255,255,.7); border-radius: var(--radius-sm); }
 .price-card-source { font-weight: 500; color: var(--c-text-2); min-width: 90px; }
@@ -1738,25 +1739,38 @@ select.admin-input { cursor: pointer; appearance: auto; }
 .price-card-disclaimer { margin-top: .5rem; padding-top: .4rem; border-top: 1px dashed #a7f3d0; font-size: .75rem; color: var(--c-text-4); line-height: 1.4; }
 .price-card--rx .price-card-disclaimer { border-top-color: #fcd34d; }
 
-.price-list { margin-top: .75rem; padding: .6rem .75rem; background: var(--c-success-l); border: 1px solid #a7f3d0; border-left: 4px solid var(--c-success); border-radius: var(--radius); font-size: .85rem; }
-.price-list-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .35rem; padding-bottom: .35rem; border-bottom: 1px solid #d1fae5; font-weight: 700; font-size: .875rem; color: #065f46; }
-.price-list-title { flex: 1; }
-.price-list-rx { display: inline-block; padding: .1rem .45rem; font-size: .68rem; font-weight: 700; color: #fff; background: var(--c-warning); border-radius: 4px; letter-spacing: .03em; }
-.price-list-range { padding: .25rem 0; font-weight: 700; color: #047857; font-size: .875rem; }
-.price-list-drugs { list-style: none; margin: .25rem 0 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
-.price-list-drug { padding: .35rem .5rem; background: rgba(255,255,255,.85); border-radius: var(--radius-sm); border: 1px solid #d1fae5; }
-.price-list-drug-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
-.price-list-drug-name { font-weight: 500; color: var(--c-text); min-width: 0; flex: 1 1 140px; }
-.price-list-drug-cheapest { font-weight: 700; color: #047857; }
-.price-list-link { color: var(--c-brand); font-size: .85rem; }
+.price-list { margin-top: .85rem; padding: .9rem .95rem; background: linear-gradient(180deg, #f8fafc 0%, #ecfdf5 100%); border: 1px solid #bae6d4; border-left: 4px solid var(--c-success); border-radius: 12px; font-size: .86rem; box-shadow: var(--shadow-xs); }
+.price-list-header { display: flex; align-items: flex-start; gap: .5rem; margin-bottom: .55rem; padding-bottom: .55rem; border-bottom: 1px solid #d1fae5; color: #065f46; }
+.price-list-header-main { display: flex; flex-direction: column; gap: .15rem; flex: 1; min-width: 0; }
+.price-list-title { font-weight: 800; font-size: .93rem; color: #064e3b; line-height: 1.3; }
+.price-list-subtitle { font-size: .74rem; color: #047857; letter-spacing: .01em; text-transform: uppercase; font-weight: 700; }
+.price-list-rx { display: inline-block; padding: .15rem .55rem; font-size: .68rem; font-weight: 700; color: #fff; background: var(--c-warning); border-radius: var(--radius-full); letter-spacing: .03em; margin-top: .05rem; }
+.price-list-range { padding: .2rem 0 .45rem; font-weight: 600; color: #065f46; font-size: .84rem; }
+.price-list-drugs { list-style: none; margin: .3rem 0 0; padding: 0; display: flex; flex-direction: column; gap: .45rem; }
+.price-list-drug { padding: .55rem .65rem; background: rgba(255,255,255,.9); border-radius: 10px; border: 1px solid #d1fae5; }
+.price-list-drug-row { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
+.price-list-drug-name { font-weight: 600; color: #0f172a; min-width: 0; flex: 1 1 180px; line-height: 1.35; }
+.price-list-pill { padding: .12rem .45rem; border-radius: var(--radius-full); background: #dcfce7; color: #15803d; font-size: .68rem; font-weight: 700; letter-spacing: .02em; }
+.price-list-drug-cheapest { font-weight: 800; color: #047857; font-size: .9rem; }
+.price-list-link { color: var(--c-brand-dark); font-size: .78rem; font-weight: 600; padding: .15rem .5rem; border: 1px solid #bfdbfe; border-radius: var(--radius-full); background: #eff6ff; }
 .price-list-link:hover { text-decoration: underline; }
-.price-list-expand-btn { margin-left: auto; padding: .15rem .5rem; font-size: .72rem; color: var(--c-text-3); background: transparent; border: 1px solid var(--c-border-2); border-radius: 4px; cursor: pointer; font-family: var(--font); }
+.price-list-expand-btn { margin-left: auto; padding: .18rem .58rem; font-size: .72rem; color: var(--c-text-3); background: transparent; border: 1px solid var(--c-border-2); border-radius: var(--radius-full); cursor: pointer; font-family: var(--font); font-weight: 600; }
 .price-list-expand-btn:hover { background: var(--c-surface-2); }
-.price-list-options { list-style: none; margin: .35rem 0 0 .75rem; padding: 0 0 0 .5rem; border-left: 2px solid var(--c-border); display: flex; flex-direction: column; gap: .2rem; }
-.price-list-option { display: flex; align-items: center; gap: .5rem; font-size: .8rem; }
-.price-list-option-source { font-weight: 500; color: var(--c-text-3); min-width: 90px; }
+.price-list-source { margin-top: .35rem; font-size: .75rem; color: var(--c-text-3); }
+.price-list-options { list-style: none; margin: .45rem 0 0 .6rem; padding: 0 0 0 .6rem; border-left: 2px solid #bbf7d0; display: flex; flex-direction: column; gap: .3rem; }
+.price-list-option { display: flex; align-items: center; gap: .45rem; font-size: .78rem; flex-wrap: wrap; }
+.price-list-option-source { font-weight: 600; color: var(--c-text-3); min-width: 130px; }
 .price-list-option-price { font-weight: 700; color: #047857; }
-.price-list-disclaimer { margin-top: .5rem; padding-top: .4rem; border-top: 1px dashed #a7f3d0; font-size: .75rem; color: var(--c-text-4); line-height: 1.4; }
+.price-list-option-link { color: var(--c-brand-dark); font-size: .72rem; font-weight: 600; }
+.price-list-option-link:hover { text-decoration: underline; }
+.price-list-disclaimer { margin-top: .6rem; padding-top: .45rem; border-top: 1px dashed #a7f3d0; font-size: .74rem; color: var(--c-text-4); line-height: 1.45; }
+
+@media (max-width: 640px) {
+  .price-list { padding: .75rem .8rem; }
+  .price-list-drug { padding: .5rem .55rem; }
+  .price-list-option-source { min-width: unset; flex: 1 1 100%; }
+  .price-list-source { line-height: 1.35; }
+}
 
 /* Account page */
 .account-page { height: 100%; display: flex; align-items: center; justify-content: center; padding: 2rem; background: var(--c-bg); overflow-y: auto; }

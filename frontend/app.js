@@ -1258,25 +1258,30 @@ export function MessageBubble({ message, onFeedback }) {
                 return { drug_name: d.drug_name, options: d.options, cheapest: { unit: c.unit, price: c.price, source_name: c.source_name, source_url: c.source_url } };
               });
             })();
+        const formatPriceWithUnit = (price, unit) => (unit ? `${price}/${unit}` : `${price}`);
         return (
           <div className="price-list">
             <div className="price-list-header">
-              <span className="price-list-title">{priceData.drug_name || "Giá thuốc"}</span>
+              <div className="price-list-header-main">
+                <span className="price-list-title">{priceData.drug_name || "Giá thuốc"}</span>
+                <span className="price-list-subtitle">Bảng giá tham khảo</span>
+              </div>
               {priceData.is_prescription && <span className="price-list-rx">Rx</span>}
             </div>
             {priceData.price_range && (
-              <div className="price-list-range">{priceData.price_range}</div>
+              <div className="price-list-range"><strong>Khoảng giá:</strong> {priceData.price_range}</div>
             )}
             <ul className="price-list-drugs">
               {drugs.map((d, di) => (
                 <li key={di} className="price-list-drug">
                   <div className="price-list-drug-row">
                     <span className="price-list-drug-name">{d.drug_name}</span>
+                    <span className="price-list-pill">Giá thấp nhất</span>
                     <span className="price-list-drug-cheapest">
-                      {d.cheapest.price}/{d.cheapest.unit}
+                      {formatPriceWithUnit(d.cheapest.price, d.cheapest.unit)}
                     </span>
                     {d.cheapest.source_url && (
-                      <a className="price-list-link" href={d.cheapest.source_url} target="_blank" rel="noopener noreferrer" title="Xem tại nhà thuốc">↗</a>
+                      <a className="price-list-link" href={d.cheapest.source_url} target="_blank" rel="noopener noreferrer" title="Xem tại nhà thuốc">Xem</a>
                     )}
                     {d.options.length > 1 && (
                       <button type="button" className="price-list-expand-btn" onClick={() => toggleDrugExpand(d.drug_name)} aria-expanded={expandedDrugs.has(d.drug_name)}>
@@ -1288,7 +1293,11 @@ export function MessageBubble({ message, onFeedback }) {
                     <ul className="price-list-options">
                       {d.options.map((opt, oi) => (
                         <li key={oi} className="price-list-option">
-                          <span className="price-list-option-price">{opt.price}/{opt.unit}</span>
+                          <span className="price-list-option-source">{opt.source_name || "Nhà thuốc"}</span>
+                          <span className="price-list-option-price">{formatPriceWithUnit(opt.price, opt.unit)}</span>
+                          {opt.source_url && (
+                            <a className="price-list-option-link" href={opt.source_url} target="_blank" rel="noopener noreferrer" title="Mở nguồn giá">Mở nguồn</a>
+                          )}
                         </li>
                       ))}
                     </ul>
@@ -1309,6 +1318,7 @@ export function MessageBubble({ message, onFeedback }) {
             <span className="price-card-rx">Rx</span>
           </div>
           <div className="price-card-range">{priceData.notes || "Thuốc kê đơn – giá không niêm yết."}</div>
+          <div className="price-card-source-line">Nguồn: Nhà thuốc Long Châu</div>
           {priceData.disclaimer && (
             <div className="price-card-disclaimer">{priceData.disclaimer}</div>
           )}
