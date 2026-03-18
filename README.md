@@ -11,7 +11,7 @@ A full-stack RAG assistant for Vietnamese pharmacy workflows:
 - Backend: FastAPI, LangChain, Qdrant, MongoDB
 - LLM/Embeddings: OpenAI (`gpt-4o-mini`, `text-embedding-3-small` by default)
 - Retrieval: hybrid dense + sparse, reranking with CrossEncoder
-- Ingestion: PDF (Docling), DOC/DOCX (python-docx)
+- Ingestion: PDF (Docling), DOCX (python-docx)
 - Frontend: React + Vite (SPA served from `frontend/dist`)
 
 ## Current Architecture
@@ -197,7 +197,7 @@ Then access:
 
 ## Ingestion Notes
 
-- Supported files: `.pdf`, `.doc`, `.docx`
+- Supported files: `.pdf`, `.docx`
 - PDF parsing uses Docling markdown export.
 - Chunks are stored in Qdrant with parent/child metadata and sparse vocab side files.
 - To skip LLM summary generation during ingest, set `skip_summary=true` in form data.
