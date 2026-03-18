@@ -109,7 +109,7 @@ function App() {
     try {
       const payload = JSON.parse(atob(token.split(".")[1]));
       setIsAdmin(!!payload.admin);
-      setUsername(payload.email || payload.username || "");
+      setUsername(payload.username || payload.email || "");
     } catch {
       setIsAdmin(false);
       setUsername("");

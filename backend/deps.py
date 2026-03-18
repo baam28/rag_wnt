@@ -40,6 +40,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 class CurrentUser(BaseModel):
     id: str
+    username: str = ""
     email: str
     is_admin: bool
 
@@ -170,8 +171,10 @@ class IngestJobStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _user_from_doc(doc: dict[str, Any]) -> CurrentUser:
+    username = (doc.get("username") or doc.get("email") or "").strip()
     return CurrentUser(
         id=str(doc["_id"]),
+        username=username,
         email=doc.get("email", ""),
         is_admin=bool(doc.get("is_admin") or doc.get("roles", {}).get("admin")),
     )
@@ -181,6 +184,7 @@ def _create_jwt_for_user(user: CurrentUser) -> str:
     settings = get_settings()
     payload = {
         "sub": user.id,
+        "username": user.username,
         "email": user.email,
         "admin": user.is_admin,
         "iat": int(time.time()),
@@ -207,13 +211,14 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid token")
 
     user_id = payload.get("sub")
+    username = (payload.get("username") or payload.get("email") or "").strip()
     email = payload.get("email")
     is_admin = bool(payload.get("admin"))
 
     if not user_id or not email:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    return CurrentUser(id=user_id, email=email, is_admin=is_admin)
+    return CurrentUser(id=user_id, username=username, email=email, is_admin=is_admin)
 
 
 def get_current_admin(user: CurrentUser = Security(get_current_user)) -> CurrentUser:

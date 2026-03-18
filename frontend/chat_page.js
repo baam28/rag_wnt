@@ -79,7 +79,13 @@ function ChatPage({
         <div className="sidebar-body">
           {sessions.length === 0 && (
             <div className="sidebar-empty">
-              <div style={{ fontSize: "1.5rem", marginBottom: ".4rem" }}>💬</div>
+              <div style={{ display: "flex", justifyContent: "center", marginBottom: ".5rem", color: "#64748b" }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M4.5 6.8c0-1.8 1.4-3.3 3.3-3.3h8.4c1.8 0 3.3 1.4 3.3 3.3v5.8c0 1.8-1.4 3.3-3.3 3.3H11l-3.2 2.7c-.5.4-1.3.1-1.3-.6v-2.1H7.8c-1.8 0-3.3-1.4-3.3-3.3V6.8z" />
+                  <path d="M10 9.9h5.5" />
+                  <path d="M8.8 12.4h4.3" />
+                </svg>
+              </div>
               Chưa có cuộc trò chuyện nào.<br />Bắt đầu bằng cách đặt câu hỏi!
             </div>
           )}
@@ -125,7 +131,7 @@ function ChatPage({
             />
           </div>
           <div className="chat-empty-title">Chào mừng đến PharmaAI</div>
-          <div className="chat-empty-sub">Đặt câu hỏi về duợc liệu, tra cứu giá thuốc hoặc pháp lý dược. Tôi sẵn sàng hỗ trợ!</div>
+          <div className="chat-empty-sub">Đặt câu hỏi về dược liệu, tra cứu giá thuốc hoặc pháp lý dược. Tôi sẵn sàng hỗ trợ!</div>
         </div>
       );
     }

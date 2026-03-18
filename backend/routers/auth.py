@@ -61,19 +61,20 @@ def register(req: RegisterRequest):
     doc["_id"] = res.inserted_id
     user = _user_from_doc(doc)
     token = _create_jwt_for_user(user)
-    return AuthResponse(token=token, user=UserOut(id=user.id, username=user.email, is_admin=user.is_admin))
+    return AuthResponse(token=token, user=UserOut(id=user.id, username=user.username, is_admin=user.is_admin))
 
 
 @router.post("/auth/login", response_model=AuthResponse)
 def login(req: LoginRequest):
     """Login with username/password and return a JWT."""
-    username = (req.username or "").strip().lower()
+    login_id = (req.username or "").strip().lower()
     password = req.password or ""
-    if not username or not password:
+    if not login_id or not password:
         raise HTTPException(status_code=400, detail="Username and password are required")
 
     users = get_users_collection()
-    doc = users.find_one({"email": username})
+    # Primary: login by username. Backward-compatible fallback: email login.
+    doc = users.find_one({"username": login_id}) or users.find_one({"email": login_id})
     if not doc or "password_hash" not in doc:
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not verify_password(password, doc.get("password_hash", "")):
@@ -84,7 +85,7 @@ def login(req: LoginRequest):
 
     user = _user_from_doc(doc)
     token = _create_jwt_for_user(user)
-    return AuthResponse(token=token, user=UserOut(id=user.id, username=user.email, is_admin=user.is_admin))
+    return AuthResponse(token=token, user=UserOut(id=user.id, username=user.username, is_admin=user.is_admin))
 
 
 @router.put("/auth/password")
