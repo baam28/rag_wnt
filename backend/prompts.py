@@ -300,31 +300,64 @@ def _select_context_by_token_budget(
 
 def _extract_text_content(resp: Any) -> str:
     """Extract robust text from LangChain/OpenAI response objects."""
+    def _collect_text(value: Any) -> list[str]:
+        out: list[str] = []
+        if value is None:
+            return out
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                out.append(text)
+            return out
+        if isinstance(value, list):
+            for item in value:
+                out.extend(_collect_text(item))
+            return out
+        if isinstance(value, dict):
+            # Common OpenAI/LangChain keys where text may live.
+            for key in ("text", "output_text", "content", "value"):
+                if key in value:
+                    out.extend(_collect_text(value.get(key)))
+            # Traverse nested structures conservatively.
+            for nested_key in ("message", "output", "choices", "delta"):
+                if nested_key in value:
+                    out.extend(_collect_text(value.get(nested_key)))
+            return out
+        # Objects from LangChain blocks may expose text/content attrs.
+        out.extend(_collect_text(getattr(value, "text", None)))
+        out.extend(_collect_text(getattr(value, "content", None)))
+        return out
+
     content = getattr(resp, "content", None)
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        out_parts: list[str] = []
-        for part in content:
-            if isinstance(part, str):
-                txt = part.strip()
-                if txt:
-                    out_parts.append(txt)
-                continue
-            if isinstance(part, dict):
-                txt = str(part.get("text") or part.get("content") or "").strip()
-                if txt:
-                    out_parts.append(txt)
-                continue
-            txt = str(getattr(part, "text", "") or getattr(part, "content", "") or "").strip()
-            if txt:
-                out_parts.append(txt)
-        return "\n".join([p for p in out_parts if p]).strip()
-    return str(resp).strip() if resp is not None else ""
+    text_parts = _collect_text(content)
+    if not text_parts:
+        # Some LangChain/OpenAI adapters keep text in metadata/additional_kwargs.
+        text_parts.extend(_collect_text(getattr(resp, "additional_kwargs", None)))
+        text_parts.extend(_collect_text(getattr(resp, "response_metadata", None)))
+    if not text_parts and hasattr(resp, "text"):
+        try:
+            text_attr = getattr(resp, "text")
+            text_parts.extend(_collect_text(text_attr))
+        except Exception:
+            pass
+    return "\n".join([p for p in text_parts if p]).strip()
 
 
 def _friendly_llm_error(err: Exception) -> str:
     return "Xin lỗi, mình chưa tạo được câu trả lời đầy đủ từ dữ liệu hiện có."
+
+
+def _extract_refusal(resp: Any) -> str:
+    try:
+        addl = getattr(resp, "additional_kwargs", {}) or {}
+        refusal = addl.get("refusal")
+        if refusal is None:
+            return ""
+        if isinstance(refusal, str):
+            return refusal.strip()
+        return str(refusal).strip()
+    except Exception:
+        return ""
 
 
 def _extract_usage(resp: Any) -> Dict[str, int]:
@@ -453,9 +486,21 @@ def _generate_with_openai(
         max_tokens=max_output_tokens,
     )
 
+    fallback_model_name = (getattr(settings, "llm_fallback_model", "") or "").strip()
+    use_fallback = bool(fallback_model_name and fallback_model_name != model_name)
+
     try:
         resp = llm.invoke(messages)
         content = _extract_text_content(resp)
+        refusal_reason = _extract_refusal(resp)
+        if not content and refusal_reason:
+            logger.warning(
+                "LLM refusal detected. model=%s query=%r refusal=%r finish_reason=%r",
+                model_name,
+                (query or "")[:200],
+                refusal_reason[:400],
+                (getattr(resp, "response_metadata", {}) or {}).get("finish_reason"),
+            )
         if not content:
             # Safety net: ask once more with a minimal direct instruction.
             rescue_messages = list(messages)
@@ -466,6 +511,13 @@ def _generate_with_openai(
             try:
                 rescue = llm.invoke(rescue_messages)
                 content = _extract_text_content(rescue)
+                if not content and _extract_refusal(rescue):
+                    logger.warning(
+                        "LLM refusal on rescue. model=%s query=%r refusal=%r",
+                        model_name,
+                        (query or "")[:200],
+                        _extract_refusal(rescue)[:400],
+                    )
             except Exception as rescue_err:
                 logger.exception(
                     "LLM rescue invoke failed. model=%s query=%r context_items=%d",
@@ -474,13 +526,49 @@ def _generate_with_openai(
                     len(context_list or []),
                 )
                 return _friendly_llm_error(rescue_err), empty_usage
+        if not content and use_fallback:
+            try:
+                fallback_llm = ChatOpenAI(
+                    model=fallback_model_name,
+                    api_key=settings.openai_api_key,
+                    temperature=0.2,
+                    max_tokens=max_output_tokens,
+                )
+                fallback_resp = fallback_llm.invoke(messages)
+                content = _extract_text_content(fallback_resp)
+                if content:
+                    logger.warning(
+                        "Recovered by fallback model. primary=%s fallback=%s query=%r",
+                        model_name,
+                        fallback_model_name,
+                        (query or "")[:200],
+                    )
+                    usage = _extract_usage(fallback_resp)
+                    return content, usage
+                logger.warning(
+                    "Fallback model also returned empty. primary=%s fallback=%s query=%r fallback_refusal=%r",
+                    model_name,
+                    fallback_model_name,
+                    (query or "")[:200],
+                    _extract_refusal(fallback_resp)[:400],
+                )
+            except Exception:
+                logger.exception(
+                    "Fallback model invoke failed. primary=%s fallback=%s query=%r",
+                    model_name,
+                    fallback_model_name,
+                    (query or "")[:200],
+                )
         if not content:
             logger.warning(
-                "LLM returned empty content after rescue. model=%s query=%r prompt_tokens_est=%d context_items=%d",
+                "LLM returned empty content after rescue. model=%s query=%r prompt_tokens_est=%d context_items=%d content_repr=%r addl_keys=%s meta_keys=%s",
                 model_name,
                 (query or "")[:200],
                 _message_tokens(messages),
                 len(context_list or []),
+                repr(getattr(resp, "content", None))[:500],
+                list((getattr(resp, "additional_kwargs", {}) or {}).keys()),
+                list((getattr(resp, "response_metadata", {}) or {}).keys()),
             )
             content = _friendly_llm_error(ValueError("empty_content"))
         usage = _extract_usage(resp)

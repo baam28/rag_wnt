@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
     llm_model: str = "gpt-4o-mini"
+    llm_fallback_model: str = "gpt-4o-mini"
     reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     llm_total_budget_tokens: int = 12000
     llm_context_budget_ratio: float = 0.78
