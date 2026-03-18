@@ -1,8 +1,19 @@
+from collections import defaultdict, deque
 from typing import Any, Optional, List, Dict, Tuple
+
+import logging
+import re
+
+try:
+    import tiktoken
+except Exception:  # pragma: no cover - fallback when tokenizer lib unavailable
+    tiktoken = None
 
 from langchain_openai import ChatOpenAI
 
 from config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """Bạn là trợ lý pháp lý – dược học, trả lời dựa trên context được cung cấp.
@@ -126,24 +137,194 @@ Hướng dẫn: Với câu hỏi pháp lý, trả lời theo cấu trúc: (1) "C
 
 def _clean_source_name(source: str) -> str:
     """Strip common file extensions and trailing whitespace from a source filename."""
-    import re
     name = (source or "Unknown").strip()
     # Remove common doc extensions (case-insensitive)
     name = re.sub(r'\s*\.(?:docx?|pdf|xlsx?|txt|csv)\s*$', '', name, flags=re.IGNORECASE)
     return name.strip()
 
 
-def build_context_block(context_list: List[Dict[str, Any]], include_labels: bool = True) -> str:
-    """Format retrieved context, optionally labelling each block with the clean document name."""
-    blocks = []
-    for ctx in context_list:
-        content = ctx.get("content", "").strip()
-        if include_labels:
-            source = _clean_source_name(ctx.get("source", "Unknown"))
-            blocks.append(f"[{source}]\n{content}")
+def _get_encoder(model: str):
+    if not tiktoken:
+        return None
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(text: str, encoder) -> int:
+    if not text:
+        return 0
+    if encoder:
+        try:
+            return len(encoder.encode(text))
+        except Exception:
+            pass
+    # Fallback heuristic ~ 4 chars/token
+    return max(1, len(text) // 4)
+
+
+def _truncate_to_tokens(text: str, max_tokens: int, encoder) -> str:
+    if not text or max_tokens <= 0:
+        return ""
+    if _count_tokens(text, encoder) <= max_tokens:
+        return text
+    if encoder:
+        try:
+            ids = encoder.encode(text)
+            cut = ids[:max_tokens]
+            out = encoder.decode(cut).strip()
+            return out + " ..."
+        except Exception:
+            pass
+    approx_chars = max_tokens * 4
+    return text[:approx_chars].rstrip() + " ..."
+
+
+def _context_rank(ctx: Dict[str, Any]) -> int:
+    rank = ctx.get("rank")
+    try:
+        return int(rank)
+    except Exception:
+        return 10**6
+
+
+def _format_context_item(
+    ctx: Dict[str, Any],
+    include_labels: bool,
+    encoder,
+    per_item_soft_cap_tokens: int,
+) -> str:
+    source = _clean_source_name(ctx.get("source", "Unknown"))
+    summary = (ctx.get("summary") or "").strip()
+    content = (ctx.get("content") or "").strip()
+    rank = _context_rank(ctx)
+
+    # Keep summary + head of the content first (soft cap by token, not char).
+    body_parts: list[str] = []
+    if summary:
+        body_parts.append(f"Tóm tắt: {summary}")
+    if content:
+        if summary:
+            summary_tokens = _count_tokens(body_parts[0], encoder)
+            content_budget = max(40, per_item_soft_cap_tokens - summary_tokens)
         else:
-            blocks.append(content)
-    return "\n\n---\n\n".join(blocks)
+            content_budget = per_item_soft_cap_tokens
+        body_parts.append(_truncate_to_tokens(content, content_budget, encoder))
+
+    body = "\n".join([p for p in body_parts if p]).strip()
+    if include_labels:
+        return f"[{source}] (rank={rank})\n{body}".strip()
+    return body
+
+
+def _build_diverse_ordered_context(
+    context_list: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Prioritise top rank per source first, then second-best per source, etc."""
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for ctx in context_list:
+        source = _clean_source_name(ctx.get("source", "Unknown"))
+        grouped[source].append(ctx)
+    for source in grouped:
+        grouped[source].sort(key=_context_rank)
+
+    source_order = sorted(grouped.keys(), key=lambda s: _context_rank(grouped[s][0]))
+    queues = {s: deque(grouped[s]) for s in source_order}
+
+    out: List[Dict[str, Any]] = []
+    while True:
+        progressed = False
+        for s in source_order:
+            if queues[s]:
+                out.append(queues[s].popleft())
+                progressed = True
+        if not progressed:
+            break
+    return out
+
+
+def _select_context_by_token_budget(
+    context_list: List[Dict[str, Any]],
+    total_context_budget_tokens: int,
+    include_labels: bool,
+    encoder,
+    per_item_soft_cap_tokens: int,
+) -> str:
+    ordered = _build_diverse_ordered_context(context_list)
+    blocks: List[str] = []
+    used = 0
+    sep = "\n\n---\n\n"
+    sep_tokens = _count_tokens(sep, encoder)
+
+    for ctx in ordered:
+        block = _format_context_item(
+            ctx=ctx,
+            include_labels=include_labels,
+            encoder=encoder,
+            per_item_soft_cap_tokens=per_item_soft_cap_tokens,
+        )
+        if not block:
+            continue
+        block_tokens = _count_tokens(block, encoder)
+        extra = block_tokens if not blocks else block_tokens + sep_tokens
+
+        if used + extra <= total_context_budget_tokens:
+            blocks.append(block)
+            used += extra
+            continue
+
+        remaining = total_context_budget_tokens - used - (sep_tokens if blocks else 0)
+        if remaining >= 40:
+            shortened = _truncate_to_tokens(block, remaining, encoder)
+            if shortened:
+                blocks.append(shortened)
+            break
+        break
+
+    if blocks:
+        return sep.join(blocks)
+
+    # Fallback: always keep at least the best-ranked context in clipped form.
+    if ordered:
+        first = _format_context_item(
+            ctx=ordered[0],
+            include_labels=include_labels,
+            encoder=encoder,
+            per_item_soft_cap_tokens=max(80, per_item_soft_cap_tokens),
+        )
+        if first:
+            return _truncate_to_tokens(first, max(80, total_context_budget_tokens), encoder)
+    return ""
+
+
+def _extract_text_content(resp: Any) -> str:
+    """Extract robust text from LangChain/OpenAI response objects."""
+    content = getattr(resp, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        out_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                txt = part.strip()
+                if txt:
+                    out_parts.append(txt)
+                continue
+            if isinstance(part, dict):
+                txt = str(part.get("text") or part.get("content") or "").strip()
+                if txt:
+                    out_parts.append(txt)
+                continue
+            txt = str(getattr(part, "text", "") or getattr(part, "content", "") or "").strip()
+            if txt:
+                out_parts.append(txt)
+        return "\n".join([p for p in out_parts if p]).strip()
+    return str(resp).strip() if resp is not None else ""
+
+
+def _friendly_llm_error(err: Exception) -> str:
+    return "Xin lỗi, mình chưa tạo được câu trả lời đầy đủ từ dữ liệu hiện có."
 
 
 def _extract_usage(resp: Any) -> Dict[str, int]:
@@ -164,6 +345,7 @@ def _generate_with_openai(
     query: str,
     context_list: List[Dict[str, Any]],
     history: Optional[List[Dict[str, str]]] = None,
+    history_summary: Optional[str] = None,
     system_prompt: Optional[str] = None,
     user_template: Optional[str] = None,
 ) -> Tuple[str, Dict[str, int]]:
@@ -179,44 +361,150 @@ def _generate_with_openai(
     if not context_list:
         return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)", empty_usage
 
-    context_block = build_context_block(context_list, include_labels=(system_prompt != DRUG_SYSTEM_PROMPT))
     template = user_template or USER_PROMPT_TEMPLATE
+    model_name = settings.llm_model
+    encoder = _get_encoder(model_name)
+    include_labels = (system_prompt != DRUG_SYSTEM_PROMPT)
+    max_output_tokens = settings.llm_max_output_tokens_default
+    if (system_prompt or SYSTEM_PROMPT) in (SYSTEM_PROMPT, COMBINED_SYSTEM_PROMPT):
+        max_output_tokens = settings.llm_max_output_tokens_legal
+
+    llm_total_budget = max(settings.llm_total_budget_tokens, max_output_tokens + 1500)
+    input_budget = max(1000, llm_total_budget - max_output_tokens)
+
+    system_msg = system_prompt or SYSTEM_PROMPT
+    user_template_without_context = template.format(context="", question=query)
+    fixed_tokens = _count_tokens(system_msg, encoder) + _count_tokens(user_template_without_context, encoder)
+    available_dynamic_tokens = max(400, input_budget - fixed_tokens)
+
+    history_budget = int(available_dynamic_tokens * settings.llm_history_budget_ratio)
+    context_budget = int(available_dynamic_tokens * settings.llm_context_budget_ratio)
+    slack = max(120, available_dynamic_tokens - history_budget - context_budget)
+
+    # Keep summary + recent turns under history budget.
+    history_messages: List[Dict[str, str]] = []
+    history_used = 0
+    if history_summary:
+        summary_text = _truncate_to_tokens(history_summary, max(40, history_budget // 2), encoder)
+        if summary_text:
+            history_messages.append({
+                "role": "system",
+                "content": f"Tóm tắt hội thoại trước đó: {summary_text}",
+            })
+            history_used += _count_tokens(history_messages[-1]["content"], encoder)
+
+    raw_history = []
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                raw_history.append({"role": role, "content": content})
+    for msg in raw_history[-8:]:
+        content_tokens = _count_tokens(msg["content"], encoder)
+        if history_used + content_tokens <= history_budget:
+            history_messages.append(msg)
+            history_used += content_tokens
+        else:
+            remaining = history_budget - history_used
+            if remaining >= 30:
+                clipped = _truncate_to_tokens(msg["content"], remaining, encoder)
+                if clipped:
+                    history_messages.append({"role": msg["role"], "content": clipped})
+            break
+
+    per_item_soft_cap = max(120, min(settings.llm_context_chunk_soft_cap_tokens, context_budget // max(1, len(context_list))))
+    context_block = _select_context_by_token_budget(
+        context_list=context_list,
+        total_context_budget_tokens=max(120, context_budget + slack // 2),
+        include_labels=include_labels,
+        encoder=encoder,
+        per_item_soft_cap_tokens=per_item_soft_cap,
+    )
     user_msg = template.format(context=context_block, question=query)
+
+    # Final guardrail: if still over input budget, progressively shrink context then history.
+    def _message_tokens(msgs: List[Dict[str, str]]) -> int:
+        # Approximate chat overhead with +4 tokens/message
+        return sum(_count_tokens(m.get("content", ""), encoder) + 4 for m in msgs)
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_msg}]
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": user_msg})
+    if _message_tokens(messages) > input_budget:
+        shrink_budget = max(80, int(context_budget * 0.75))
+        context_block = _select_context_by_token_budget(
+            context_list=context_list,
+            total_context_budget_tokens=shrink_budget,
+            include_labels=include_labels,
+            encoder=encoder,
+            per_item_soft_cap_tokens=max(100, per_item_soft_cap - 40),
+        )
+        user_msg = template.format(context=context_block, question=query)
+        messages = [{"role": "system", "content": system_msg}] + history_messages + [{"role": "user", "content": user_msg}]
+    while len(messages) > 2 and _message_tokens(messages) > input_budget:
+        # Drop oldest non-system history message first.
+        del messages[1]
+
     llm = ChatOpenAI(
-        model=settings.llm_model,
+        model=model_name,
         api_key=settings.openai_api_key,
         temperature=0.2,
+        max_tokens=max_output_tokens,
     )
-
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
-    ]
-    if history:
-        for msg in history[-8:]:
-            role = msg.get("role")
-            content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_msg})
 
     try:
         resp = llm.invoke(messages)
-        content = resp.content if hasattr(resp, "content") else str(resp)
+        content = _extract_text_content(resp)
+        if not content:
+            # Safety net: ask once more with a minimal direct instruction.
+            rescue_messages = list(messages)
+            rescue_messages.append({
+                "role": "system",
+                "content": "Nếu chưa chắc chắn, vẫn phải trả lời ngắn gọn theo context hiện có; tuyệt đối không để trống.",
+            })
+            try:
+                rescue = llm.invoke(rescue_messages)
+                content = _extract_text_content(rescue)
+            except Exception as rescue_err:
+                logger.exception(
+                    "LLM rescue invoke failed. model=%s query=%r context_items=%d",
+                    model_name,
+                    (query or "")[:200],
+                    len(context_list or []),
+                )
+                return _friendly_llm_error(rescue_err), empty_usage
+        if not content:
+            logger.warning(
+                "LLM returned empty content after rescue. model=%s query=%r prompt_tokens_est=%d context_items=%d",
+                model_name,
+                (query or "")[:200],
+                _message_tokens(messages),
+                len(context_list or []),
+            )
+            content = _friendly_llm_error(ValueError("empty_content"))
         usage = _extract_usage(resp)
         return content, usage
     except Exception as e:
-        return f"Lỗi khi tạo câu trả lời: {e}", empty_usage
+        logger.exception(
+            "LLM invoke failed. model=%s query=%r context_items=%d",
+            model_name,
+            (query or "")[:200],
+            len(context_list or []),
+        )
+        return _friendly_llm_error(e), empty_usage
 
 
 def generate_answer(
     query: str,
     context_list: List[Dict[str, Any]],
     history: Optional[List[Dict[str, str]]] = None,
+    history_summary: Optional[str] = None,
     system_prompt: Optional[str] = None,
     user_template: Optional[str] = None,
 ) -> Tuple[str, Dict[str, int]]:
     """Return (grounded answer with citations, usage_dict)."""
     return _generate_with_openai(
-        query, context_list, history=history,
+        query, context_list, history=history, history_summary=history_summary,
         system_prompt=system_prompt, user_template=user_template,
     )

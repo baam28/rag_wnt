@@ -39,6 +39,46 @@ from drug_price_tool import detect_price_query, get_vietnam_drug_price
 from llm_usage import record_usage
 
 router = APIRouter(tags=["chat"])
+HISTORY_MAX_TURNS = 4
+HISTORY_MAX_MESSAGES = HISTORY_MAX_TURNS * 2
+HISTORY_MAX_CHARS = 800
+HISTORY_RECENT_TURNS = 3
+HISTORY_RECENT_MESSAGES = HISTORY_RECENT_TURNS * 2
+HISTORY_SUMMARY_MAX_CHARS = 500
+
+
+def _sanitize_history(history: list[ChatMessage] | None) -> list[dict[str, str]]:
+    sanitized: list[dict[str, str]] = []
+    for m in history or []:
+        role = (m.role or "").strip()
+        content = (m.content or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        sanitized.append({"role": role, "content": content[:HISTORY_MAX_CHARS]})
+    return sanitized[-HISTORY_MAX_MESSAGES:]
+
+
+def _build_history_summary(history: list[dict[str, str]]) -> str:
+    if not history:
+        return ""
+    lines: list[str] = []
+    for m in history:
+        role = "Người dùng" if m.get("role") == "user" else "Trợ lý"
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content[:120]}")
+    if not lines:
+        return ""
+    summary = " | ".join(lines)
+    return summary[:HISTORY_SUMMARY_MAX_CHARS]
+
+
+def _prepare_history_for_prompt(history: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
+    recent = history[-HISTORY_RECENT_MESSAGES:]
+    older = history[:-HISTORY_RECENT_MESSAGES]
+    summary = _build_history_summary(older)
+    return recent, summary
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +172,8 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         rag_docs: list[dict[str, Any]] = []
 
         # Build history first — needed by retrieval for follow-up reformulation
-        history_payload = [
-            {"role": m.role, "content": m.content}
-            for m in (req.history or [])
-            if m.content and m.role in ("user", "assistant")
-        ]
+        history_payload = _sanitize_history(req.history)
+        recent_history, history_summary = _prepare_history_for_prompt(history_payload)
 
         # 1. Price agent
         price_data, price_ctx = run_price_agent(req.question, intent)
@@ -152,7 +189,12 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
                 elif c == "drug":
                     physical_collections.append(settings.drug_collection_name)
         if physical_collections:
-            rag_docs = run_federated_rag_agent(req.question, physical_collections, history=history_payload)
+            rag_docs = run_federated_rag_agent(
+                req.question,
+                physical_collections,
+                history=recent_history,
+                history_summary=history_summary,
+            )
 
         # 3. Assemble context
         final_contexts: list[dict[str, Any]] = []
@@ -183,7 +225,14 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             system_prompt = COMBINED_SYSTEM_PROMPT
             user_template = COMBINED_USER_PROMPT_TEMPLATE
 
-        answer, usage = generate_answer(req.question, final_contexts, history=history_payload, system_prompt=system_prompt, user_template=user_template)
+        answer, usage = generate_answer(
+            req.question,
+            final_contexts,
+            history=recent_history,
+            history_summary=history_summary,
+            system_prompt=system_prompt,
+            user_template=user_template,
+        )
         record_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0))
         sources = [
             {

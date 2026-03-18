@@ -4,6 +4,9 @@ import ChatPage from './chat_page.js';
 import AdminPage from './admin_page.js';
 
 const API_BASE = ""; // same origin
+const HISTORY_MAX_TURNS = 4;
+const HISTORY_MAX_MESSAGES = HISTORY_MAX_TURNS * 2;
+const HISTORY_MAX_CHARS = 800;
 
 function loadSessionsFromStorage() {
   try {
@@ -28,6 +31,16 @@ function getStoredToken() {
   } catch {
     return null;
   }
+}
+
+function sanitizeHistoryForApi(messageList) {
+  return (messageList || [])
+    .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
+    .slice(-HISTORY_MAX_MESSAGES)
+    .map((m) => ({
+      role: m.role,
+      content: String(m.content).slice(0, HISTORY_MAX_CHARS),
+    }));
 }
 
 function App() {
@@ -424,11 +437,7 @@ function App() {
     setIsSending(true);
     try {
       // Build short history window for API (/ask)
-      const history = nextMessages
-        .slice(0, -1)
-        .filter((m) => m.role === "user" || m.role === "assistant")
-        .slice(-8)
-        .map((m) => ({ role: m.role, content: m.content }));
+      const history = sanitizeHistoryForApi(nextMessages.slice(0, -1));
 
       const resp = await authFetch(`${API_BASE}/ask`, {
         method: "POST",
