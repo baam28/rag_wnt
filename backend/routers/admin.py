@@ -42,6 +42,24 @@ _FEEDBACK_FILE = Path(__file__).resolve().parent.parent.parent / "feedback.json"
 _feedback_lock = threading.Lock()
 
 
+def _is_root_admin_identity(username: str | None, email: str | None) -> bool:
+    u = (username or "").strip().lower()
+    e = (email or "").strip().lower()
+    # Primary root identity is username=admin.
+    # Keep email=admin as legacy fallback for old records.
+    return u == "admin" or e == "admin"
+
+
+def _is_root_admin_doc(doc: dict[str, Any] | None) -> bool:
+    if not doc:
+        return False
+    return _is_root_admin_identity(doc.get("username"), doc.get("email"))
+
+
+def _is_root_admin_user(user: CurrentUser) -> bool:
+    return _is_root_admin_identity(user.username, user.email)
+
+
 def _load_feedback() -> list[dict]:
     if _FEEDBACK_FILE.exists():
         try:
@@ -348,7 +366,14 @@ def clear_db(current_user: CurrentUser = Depends(get_current_admin)):
 @router.get("/admin/users", response_model=list[UserOut])
 def get_all_users(current_user: CurrentUser = Depends(get_current_admin)):
     docs = get_users_collection().find().sort("created_at", -1)
-    return [UserOut(id=str(d["_id"]), username=d.get("email", ""), is_admin=bool(d.get("is_admin", False))) for d in docs]
+    return [
+        UserOut(
+            id=str(d["_id"]),
+            username=d.get("username") or d.get("email", ""),
+            is_admin=bool(d.get("is_admin", False)),
+        )
+        for d in docs
+    ]
 
 
 @router.put("/admin/users/{user_id}/role")
@@ -363,8 +388,8 @@ def update_user_role(
     target = users_coll.find_one({"_id": ObjectId(user_id)})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    if target.get("email") == "admin":
-        raise HTTPException(status_code=400, detail="Cannot change role of root admin")
+    if _is_root_admin_doc(target) and not _is_root_admin_user(current_user):
+        raise HTTPException(status_code=403, detail="Root admin role cannot be changed by other admin accounts")
     users_coll.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_admin": req.is_admin}})
     return {"message": "User role updated successfully"}
 
@@ -378,6 +403,11 @@ def admin_set_user_password(
     if len(req.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password too short (min 6 chars)")
     users_coll = get_users_collection()
+    target = users_coll.find_one({"_id": ObjectId(user_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if _is_root_admin_doc(target) and not _is_root_admin_user(current_user):
+        raise HTTPException(status_code=403, detail="Root admin password cannot be changed by other admin accounts")
     res = users_coll.update_one({"_id": ObjectId(user_id)}, {"$set": {"password_hash": hash_password(req.new_password)}})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
@@ -395,8 +425,8 @@ def delete_user(
     target = users_coll.find_one({"_id": ObjectId(user_id)})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    if target.get("email") == "admin":
-        raise HTTPException(status_code=400, detail="Cannot delete root admin")
+    if _is_root_admin_doc(target) and not _is_root_admin_user(current_user):
+        raise HTTPException(status_code=403, detail="Root admin account cannot be deleted by other admin accounts")
     res = users_coll.delete_one({"_id": ObjectId(user_id)})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
