@@ -36,12 +36,12 @@ def _format_price_as_context(price_data: dict[str, Any]) -> dict[str, Any]:
         lines.append(price_data.get("notes", "Giá thuốc kê đơn không niêm yết công khai."))
     else:
         price_range = price_data.get("price_range", "")
-        if price_range:
+        if price_range and "không tìm thấy giá" not in str(price_range).lower():
             lines.append(f"Khoảng giá: {price_range}")
         drugs = price_data.get("drugs", [])
         if drugs:
             lines.append(
-                f"Có {len(drugs)} loại thuốc liên quan. Chi tiết từng thuốc và link xem ở bảng giá bên dưới."
+                f"Có {len(drugs)} loại thuốc liên quan. Chi tiết từng thuốc xem ở bảng giá bên dưới."
             )
         else:
             for p in price_data.get("prices", []):
@@ -61,7 +61,7 @@ def _format_price_as_context(price_data: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "content": "\n".join(lines),
-        "source": "Tra cứu giá thuốc trực tuyến",
+        "source": "Nhà thuốc Long Châu",
         "summary": price_data.get("price_range", f"Giá thuốc {drug}"),
         "collection_name": None,
         "rank": 0,
@@ -116,4 +116,3 @@ def run_federated_rag_agent(
             exc_info=True,
         )
         return []
-

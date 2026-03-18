@@ -210,7 +210,7 @@ def _title_case(name: str) -> str:
 # Long Châu scraper
 # ---------------------------------------------------------------------------
 
-def _scrape_longchau(drug_name: str, drug_only: bool = True) -> list[dict[str, Any]]:
+def _scrape_longchau(drug_name: str, drug_only: bool = True) -> tuple[list[dict[str, Any]], bool]:
     """Scrape Long Châu search results via SSR __NEXT_DATA__ JSON.
 
     Makes a single GET request to the search page and parses the embedded
@@ -226,10 +226,10 @@ def _scrape_longchau(drug_name: str, drug_only: bool = True) -> list[dict[str, A
                 "Long Châu search returned HTTP %d for query '%s'.",
                 resp.status_code, drug_name,
             )
-            return []
+            return [], False
     except httpx.HTTPError:
         logger.warning("Long Châu HTTP error while searching for '%s'.", drug_name, exc_info=True)
-        return []
+        return [], False
 
     match = re.search(
         r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
@@ -238,13 +238,13 @@ def _scrape_longchau(drug_name: str, drug_only: bool = True) -> list[dict[str, A
     )
     if not match:
         logger.warning("Long Châu: __NEXT_DATA__ not found in response for '%s'.", drug_name)
-        return []
+        return [], False
 
     try:
         nd = json.loads(match.group(1))
     except json.JSONDecodeError:
         logger.warning("Long Châu: failed to parse __NEXT_DATA__ JSON for '%s'.", drug_name)
-        return []
+        return [], False
 
     products = (
         nd.get("props", {})
@@ -265,6 +265,7 @@ def _scrape_longchau(drug_name: str, drug_only: bool = True) -> list[dict[str, A
     ]
 
     results = []
+    rx_hidden_price_detected = False
     for p in products:
         name = p.get("name") or p.get("webName") or ""
         slug = p.get("slug", "")
@@ -305,6 +306,8 @@ def _scrape_longchau(drug_name: str, drug_only: bool = True) -> list[dict[str, A
                     })
 
         if not name or not price_entries:
+            if is_rx and name:
+                rx_hidden_price_detected = True
             continue
 
         for pe in price_entries:
@@ -319,7 +322,7 @@ def _scrape_longchau(drug_name: str, drug_only: bool = True) -> list[dict[str, A
                 "in_stock": pe["is_inventory"],
             })
 
-    return results
+    return results, rx_hidden_price_detected
 
 
 # ---------------------------------------------------------------------------
@@ -361,16 +364,29 @@ def get_vietnam_drug_price(drug_name: str, question: str | None = None) -> dict[
       drug_name, prices[], drugs[], price_range, is_prescription, notes,
       disclaimer, source_urls
     """
-    cache_key = f"{drug_name.lower()}|{bool(question and 'thuốc' in question.lower())}"
+    cache_key = f"v2|{drug_name.lower()}|{bool(question and 'thuốc' in question.lower())}"
     cached = _cache_get(cache_key)
     if cached is not None:
         logger.debug("Price cache hit for '%s'.", drug_name)
         return cached
 
     drug_only = _drug_only_from_query(drug_name, question)
-    products = _scrape_longchau(drug_name, drug_only=drug_only)
+    products, rx_hidden_price_detected = _scrape_longchau(drug_name, drug_only=drug_only)
 
     if not products:
+        if rx_hidden_price_detected:
+            result = {
+                "drug_name": drug_name,
+                "prices": [],
+                "drugs": [],
+                "price_range": "Thuốc kê đơn (Rx) – giá không niêm yết công khai",
+                "is_prescription": True,
+                "notes": PRESCRIPTION_MESSAGE,
+                "disclaimer": DISCLAIMER,
+                "source_urls": [],
+            }
+            _cache_set(cache_key, result)
+            return result
         result = _empty_result(drug_name)
         result["disclaimer"] = DISCLAIMER
         result["source_urls"] = []

@@ -35,7 +35,7 @@ from prompts import (
 )
 from supervisor import get_intent_from_supervisor
 from agents import run_price_agent, run_federated_rag_agent
-from drug_price_tool import get_vietnam_drug_price
+from drug_price_tool import detect_price_query, get_vietnam_drug_price
 from llm_usage import record_usage
 
 router = APIRouter(tags=["chat"])
@@ -140,16 +140,17 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
 
         # 1. Price agent
         price_data, price_ctx = run_price_agent(req.question, intent)
+        is_price_question, _ = detect_price_query(req.question)
 
         # 2. RAG agent — routed by intent["collections_to_search"]
         collections = intent.get("collections_to_search", ["drug"])
         physical_collections = []
-        for c in collections:
-            if c == "legal":
-                physical_collections.append(settings.legal_collection_name)
-            elif c == "drug":
-                physical_collections.append(settings.drug_collection_name)
-                
+        if not (intent.get("price") and is_price_question and (price_data or price_ctx)):
+            for c in collections:
+                if c == "legal":
+                    physical_collections.append(settings.legal_collection_name)
+                elif c == "drug":
+                    physical_collections.append(settings.drug_collection_name)
         if physical_collections:
             rag_docs = run_federated_rag_agent(req.question, physical_collections, history=history_payload)
 
