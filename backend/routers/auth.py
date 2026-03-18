@@ -27,25 +27,31 @@ router = APIRouter(tags=["auth"])
 def register(req: RegisterRequest):
     """Register a new local user with username/password."""
     username = (req.username or "").strip().lower()
+    email = (req.email or "").strip().lower()
     password = req.password or ""
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="Username and password are required")
+    if not username or not email or not password:
+        raise HTTPException(status_code=400, detail="Username, email and password are required")
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Invalid email address")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
     users = get_users_collection()
-    if users.find_one({"email": username}):
+    if users.find_one({"username": username}):
         raise HTTPException(status_code=400, detail="Username already exists")
+    if users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     settings = get_settings()
     admin_usernames = {e.strip().lower() for e in (settings.admin_emails or [])}
-    is_admin = username in admin_usernames
+    is_admin = username in admin_usernames or email in admin_usernames
 
     doc = {
-        "email": username,
+        "username": username,
+        "email": email,
         "password_hash": hash_password(password),
         "is_admin": is_admin,
         "created_at": now,

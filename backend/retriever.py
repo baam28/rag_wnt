@@ -22,7 +22,184 @@ logger = logging.getLogger(__name__)
 
 # --- Query expansion ---
 
-def expand_query(query: str, llm: ChatOpenAI, num_variations: int = 3) -> list[str]:
+def _ingredient_hint_variations(ingredient_hints: list[str] | None) -> list[str]:
+    if not ingredient_hints:
+        return []
+    out: list[str] = []
+    for ingredient in ingredient_hints:
+        ing = (ingredient or "").strip()
+        if not ing:
+            continue
+        out.extend([ing, f"hoạt chất {ing}", f"thành phần {ing}"])
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for q in out:
+        key = q.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(q)
+    return dedup
+
+
+def _context_pack_variations(context_pack: dict[str, Any] | None) -> list[str]:
+    if not context_pack:
+        return []
+
+    entities = [str(x).strip() for x in (context_pack.get("active_entities") or []) if str(x).strip()]
+    topics = [str(x).strip() for x in (context_pack.get("active_topics") or []) if str(x).strip()]
+    latest_summary = str(context_pack.get("latest_summary") or "").strip()
+
+    out: list[str] = []
+    if entities:
+        joined_entities = ", ".join(entities[:6])
+        out.extend([
+            f"thực thể liên quan: {joined_entities}",
+            f"công dụng của {joined_entities}",
+        ])
+    if topics:
+        out.append(f"chủ đề: {', '.join(topics[:4])}")
+    if latest_summary:
+        out.append(f"ngữ cảnh hội thoại gần nhất: {latest_summary[:240]}")
+
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for q in out:
+        key = q.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(q)
+    return dedup
+
+
+def rewrite_and_expand_query(
+    query: str,
+    llm: ChatOpenAI,
+    num_variations: int = 3,
+    history: list[dict[str, str]] | None = None,
+    ingredient_hints: list[str] | None = None,
+    context_pack: dict[str, Any] | None = None,
+) -> list[str]:
+    """Build standalone query + retrieval variations in a single LLM call.
+
+    Output order is:
+    1) standalone/re-written query (or original query as fallback)
+    2) hint-based synthetic variations
+    3) model-generated semantic variations
+    """
+
+    def _context_pack_anchor(pack: dict[str, Any] | None) -> str:
+        if not pack:
+            return ""
+        entities = [str(x).strip() for x in (pack.get("active_entities") or []) if str(x).strip()]
+        topics = [str(x).strip() for x in (pack.get("active_topics") or []) if str(x).strip()]
+        latest_summary = str(pack.get("latest_summary") or "").strip()
+        parts: list[str] = []
+        if entities:
+            parts.append("Thực thể đang trao đổi: " + ", ".join(entities[:6]))
+        if topics:
+            parts.append("Chủ đề đang trao đổi: " + ", ".join(topics[:4]))
+        if latest_summary:
+            parts.append("Tóm tắt gần nhất: " + latest_summary[:240])
+        return "\n".join(parts)
+
+    base = [query] + _ingredient_hint_variations(ingredient_hints) + _context_pack_variations(context_pack)
+
+    # Keep prompt context bounded.
+    recent = (history or [])[-6:]
+    history_lines: list[str] = []
+    for m in recent:
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        role_label = "Người dùng" if m.get("role") == "user" else "Trợ lý"
+        history_lines.append(f"{role_label}: {content[:400]}")
+    history_text = "\n".join(history_lines)
+    context_anchor = _context_pack_anchor(context_pack)
+
+    prompt = (
+        "Bạn là trợ lý truy vấn tài liệu. Hãy thực hiện đồng thời 2 việc:\n"
+        "(1) Viết lại câu hỏi thành 1 truy vấn độc lập (standalone_query).\n"
+        f"(2) Tạo đúng {num_variations} biến thể truy vấn ngắn để tăng recall (variations).\n\n"
+        "YÊU CẦU:\n"
+        "- variations KHÔNG chứa standalone_query y nguyên.\n"
+        "- Giữ nguyên thực thể/thuật ngữ pháp lý quan trọng nếu có.\n"
+        "- Trả lời CHỈ bằng JSON hợp lệ theo schema:\n"
+        '{"standalone_query": "...", "variations": ["...", "..."]}\n\n'
+        f"Lịch sử gần đây:\n{history_text or '(không có)'}\n\n"
+        f"Ngữ cảnh bổ sung:\n{context_anchor or '(không có)'}\n\n"
+        f"Câu hỏi gốc: {query}"
+    )
+
+    try:
+        resp = llm.invoke(prompt)
+        content = resp.content if hasattr(resp, "content") else str(resp)
+        text = content.strip()
+        parsed: dict[str, Any] | None = None
+
+        for candidate in [text, None]:
+            if candidate is None:
+                start = text.find("{")
+                end = text.rfind("}")
+                if start == -1 or end <= start:
+                    break
+                candidate = text[start : end + 1]
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    parsed = obj
+                    break
+            except Exception:
+                continue
+
+        if not parsed:
+            return expand_query(
+                query,
+                llm,
+                num_variations=num_variations,
+                ingredient_hints=ingredient_hints,
+                context_pack=context_pack,
+            )
+
+        standalone = str(parsed.get("standalone_query") or "").strip() or query
+        raw_variations = parsed.get("variations") or []
+        if not isinstance(raw_variations, list):
+            raw_variations = []
+
+        cleaned: list[str] = []
+        for item in raw_variations:
+            line = re.sub(r"^[\d\.\)\-\*]+\s*", "", str(item or "")).strip()
+            if line and line not in cleaned:
+                cleaned.append(line)
+
+        merged = [standalone] + base[1:] + cleaned[:num_variations]
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for q in merged:
+            key = q.lower().strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            dedup.append(q)
+        return dedup or [query]
+    except Exception:
+        return expand_query(
+            query,
+            llm,
+            num_variations=num_variations,
+            ingredient_hints=ingredient_hints,
+            context_pack=context_pack,
+        )
+
+
+def expand_query(
+    query: str,
+    llm: ChatOpenAI,
+    num_variations: int = 3,
+    ingredient_hints: list[str] | None = None,
+    context_pack: dict[str, Any] | None = None,
+) -> list[str]:
     """Generate multiple query variations to capture different semantic angles."""
     prompt = """Tạo đúng {n} biến thể câu hỏi (bằng tiếng Việt hoặc tiếng Anh tùy ngữ cảnh) 
 dựa trên câu hỏi gốc dưới đây. Mỗi biến thể diễn đạt khác một chút hoặc nhấn mạnh góc độ khác 
@@ -38,16 +215,36 @@ Câu hỏi gốc: {query}"""
             line = re.sub(r"^[\d\.\)\-\*]+\s*", "", line).strip()
             if line and line not in cleaned:
                 cleaned.append(line)
+        base = [query] + _ingredient_hint_variations(ingredient_hints) + _context_pack_variations(context_pack)
         if not cleaned:
-            return [query]
-        return [query] + cleaned[:num_variations]
+            return base
+        merged = base + cleaned[:num_variations]
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for q in merged:
+            key = q.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(q)
+        return dedup
     except Exception:
-        return [query]
+        base = [query] + _ingredient_hint_variations(ingredient_hints) + _context_pack_variations(context_pack)
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for q in base:
+            key = q.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(q)
+        return dedup
 
 
 def reformulate_with_history(
     question: str,
     history: list[dict[str, str]],
+    context_pack: dict[str, Any] | None = None,
 ) -> str:
     """Rewrite a follow-up question into a self-contained standalone query.
 
@@ -60,33 +257,96 @@ def reformulate_with_history(
     - ``history`` is empty (first turn — no reformulation needed)
     - the LLM call fails for any reason (safe fallback)
     """
-    if not history:
+    def _is_context_dependent(text: str) -> bool:
+        t = (text or "").lower()
+        if not t:
+            return False
+        patterns = [
+            r"\btrên\b",
+            r"\bở trên\b",
+            r"\bđó\b",
+            r"\bnày\b",
+            r"\bvừa nêu\b",
+            r"\bcác chất\b",
+            r"\btừng chất\b",
+            r"\bchúng\b",
+            r"\bnó\b",
+            r"\bthose\b",
+            r"\bthat\b",
+            r"\bit\b",
+        ]
+        return any(re.search(p, t) for p in patterns)
+
+    def _context_pack_anchor(pack: dict[str, Any] | None) -> str:
+        if not pack:
+            return ""
+        entities = [str(x).strip() for x in (pack.get("active_entities") or []) if str(x).strip()]
+        topics = [str(x).strip() for x in (pack.get("active_topics") or []) if str(x).strip()]
+        parts: list[str] = []
+        if entities:
+            parts.append("Thực thể đang trao đổi: " + ", ".join(entities[:6]))
+        if topics:
+            parts.append("Chủ đề đang trao đổi: " + ", ".join(topics[:4]))
+        return "; ".join(parts)
+
+    if not history and not context_pack:
         return question
+
+    # Very conservative upper-bounds so we never risk blowing the LLM context
+    # window, even if caller passes huge messages.
+    MAX_HISTORY_CHARS = 4000
+    MAX_QUESTION_CHARS = 1000
 
     # Use only the last 3 turns to keep the prompt short
     recent = history[-6:]  # 3 user + 3 assistant turns at most
-    history_text = "\n".join(
-        f"{'Người dùng' if m['role'] == 'user' else 'Trợ lý'}: {m['content'][:400]}"
-        for m in recent
-        if m.get("content")
-    )
+    history_chunks: list[str] = []
+    for m in recent:
+        content = m.get("content") or ""
+        if not content:
+            continue
+        role_label = "Người dùng" if m.get("role") == "user" else "Trợ lý"
+        # Hard-cap each message to avoid any single giant block dominating.
+        snippet = content[:400]
+        history_chunks.append(f"{role_label}: {snippet}")
+
+    history_text = "\n".join(history_chunks)
+    if len(history_text) > MAX_HISTORY_CHARS:
+        # Keep the most recent portion of the history text.
+        history_text = history_text[-MAX_HISTORY_CHARS:]
+
+    safe_question = (question or "").strip()
+    if len(safe_question) > MAX_QUESTION_CHARS:
+        safe_question = safe_question[:MAX_QUESTION_CHARS]
+
+    context_anchor = _context_pack_anchor(context_pack)
+    context_dependent = _is_context_dependent(safe_question)
 
     prompt = (
-        "Dựa vào lịch sử hội thoại bên dưới, hãy viết lại câu hỏi cuối cùng của người dùng "
-        "thành một câu hỏi độc lập, đầy đủ ý nghĩa (không cần lịch sử để hiểu). "
+        "Dựa vào lịch sử hội thoại, hãy viết lại câu hỏi cuối cùng của người dùng "
+        "thành một câu hỏi tìm kiếm trọn vẹn, độc lập. BẮT BUỘC phải giữ lại tên các Luật, "
+        "Nghị định, số Điều, Khoản hoặc chủ đề pháp lý đang được nhắc đến trong bối cảnh. "
+        "Nếu người dùng dùng đại từ thay thế như 'trường hợp này', 'điều đó', 'luật trên', "
+        "hãy thay thế bằng danh từ/ngữ cảnh cụ thể từ lịch sử.\n\n"
         "Chỉ trả lời bằng câu hỏi được viết lại, không thêm giải thích.\n\n"
         f"Lịch sử:\n{history_text}\n\n"
-        f"Câu hỏi cần viết lại: {question}"
+        f"Câu hỏi cần viết lại: {safe_question}"
     )
+    if context_anchor:
+        prompt += f"\n\nNgữ cảnh phiên hội thoại bổ sung: {context_anchor}"
+
     try:
         llm = get_llm()
         resp = llm.invoke(prompt)
         rewritten = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
         if rewritten and len(rewritten) > 5:
+            if context_dependent and context_anchor:
+                rewritten = f"{rewritten}. {context_anchor}"
             logger.debug("Query reformulated: %r → %r", question, rewritten)
             return rewritten
     except Exception:
         logger.warning("Query reformulation failed; using original question.", exc_info=True)
+    if context_dependent and context_anchor:
+        return f"{question}. {context_anchor}"
     return question
 
 
@@ -351,6 +611,8 @@ def _retrieve_single_collection(
     llm: ChatOpenAI,
     client: QdrantClient,
     settings,
+    ingredient_hints: list[str] | None = None,
+    context_pack: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run full retrieval pipeline on a single collection.
@@ -361,6 +623,8 @@ def _retrieve_single_collection(
         query,
         llm,
         num_variations=settings.query_expansion_count,
+        ingredient_hints=ingredient_hints,
+        context_pack=context_pack,
     )
 
     candidates = hybrid_search(
@@ -398,6 +662,9 @@ def _retrieve_single_collection(
 def retrieve(
     query: str,
     collections_to_search: list[str],
+    history: list[dict[str, str]] | None = None,
+    ingredient_hints: list[str] | None = None,
+    context_pack: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run full retrieval using process-wide singleton clients.
@@ -418,12 +685,25 @@ def retrieve(
     if not collections_to_search:
         return []
 
+    query_variations = rewrite_and_expand_query(
+        query,
+        llm,
+        num_variations=settings.query_expansion_count,
+        history=history,
+        ingredient_hints=ingredient_hints,
+        context_pack=context_pack,
+    )
+    effective_query = query_variations[0] if query_variations else query
+
     # Parallel hybrid search: get un-ranked candidates from each collection
     def _hybrid_search_one(coll_name: str) -> list[tuple[str, dict, float, str]]:
         try:
-            variations = expand_query(query, llm, num_variations=settings.query_expansion_count)
             candidates = hybrid_search(
-                query, variations, embeddings, client, coll_name,
+                effective_query,
+                query_variations,
+                embeddings,
+                client,
+                coll_name,
                 persist_dir=settings.persist_dir, top_k=settings.hybrid_top_k
             )
             # Tag each candidate with its origin collection
@@ -454,12 +734,21 @@ def retrieve(
     all_docs = [(c[1].get("text", "") or "") for c in combined_candidates]
 
     top_k = rerank(
-        query,
+        effective_query,
         candidates_for_rerank,
         all_docs,
         all_ids,
         top_k=settings.rerank_top_k,
     )
+
+    if settings.legal_collection_name in collections_to_search:
+        top_k = _augment_legal_article_candidates(
+            query=effective_query,
+            reranked=top_k,
+            combined_candidates=combined_candidates,
+            legal_collection_name=settings.legal_collection_name,
+            extra_k=2,
+        )
 
     # Re-attach collection names and fetch parent contexts
     final_context_list = []
@@ -475,4 +764,150 @@ def retrieve(
             ctx["rank"] = rank
             final_context_list.append(ctx)
 
+    if settings.enable_context_rescore and final_context_list:
+        final_context_list = _context_aware_rescore(final_context_list, context_pack)
+
     return final_context_list
+
+
+def _context_aware_rescore(
+    context_list: list[dict[str, Any]],
+    context_pack: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not context_pack:
+        return context_list
+
+    entities = [str(x).strip().lower() for x in (context_pack.get("active_entities") or []) if str(x).strip()]
+    topics = [str(x).strip().lower() for x in (context_pack.get("active_topics") or []) if str(x).strip()]
+    anchors = entities + topics
+    if not anchors:
+        return context_list
+
+    rescored: list[dict[str, Any]] = []
+    for ctx in context_list:
+        base_score = float(ctx.get("score", 0.0) or 0.0)
+        haystack = " ".join(
+            [
+                str(ctx.get("content", "")),
+                str(ctx.get("summary", "")),
+                str(ctx.get("source", "")),
+                str(ctx.get("collection_name", "")),
+            ]
+        ).lower()
+        matches = sum(1 for anchor in anchors if anchor and anchor in haystack)
+        boost = min(0.6, matches * 0.15)
+        payload = dict(ctx)
+        payload["score"] = base_score + boost
+        rescored.append(payload)
+
+    rescored.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+    for index, item in enumerate(rescored, 1):
+        item["rank"] = index
+    return rescored
+
+
+def _extract_first_article_number(text: str) -> str | None:
+    t = (text or "").lower()
+    m = re.search(r"\bđiều\s+(\d+)\b", t)
+    if m:
+        return m.group(1)
+    m_ascii = re.search(r"\bdieu\s+(\d+)\b", t)
+    if m_ascii:
+        return m_ascii.group(1)
+    return None
+
+
+def _mentions_article(text: str, article_no: str) -> bool:
+    if not article_no:
+        return False
+    t = (text or "").lower()
+    return bool(
+        re.search(rf"\bđiều\s+{re.escape(article_no)}\b", t)
+        or re.search(rf"\bdieu\s+{re.escape(article_no)}\b", t)
+    )
+
+
+def _looks_like_follow_up_clause(text: str) -> bool:
+    """Heuristic for legal clause fragments that often omit article heading.
+
+    Typical examples:
+    - "2. Người chịu trách nhiệm..."
+    - "Khoản 2 ... Điều này"
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if re.match(r"^\s*[2-9][\.|\)]\s+", t):
+        return True
+    if re.search(r"\bkhoản\s+[2-9]\b", t) and (
+        "điều này" in t or "dieu nay" in t
+    ):
+        return True
+    return False
+
+
+def _augment_legal_article_candidates(
+    query: str,
+    reranked: list[tuple[str, dict, float]],
+    combined_candidates: list[tuple[str, dict, float, str]],
+    legal_collection_name: str,
+    extra_k: int = 2,
+) -> list[tuple[str, dict, float]]:
+    """
+    Improve legal coverage when the top result contains an article heading (e.g., "Điều 19")
+    but rerank list only keeps one fragment of that article.
+
+    Strategy:
+    - detect target article number from query, else from top reranked legal chunk text
+    - if current reranked list has <2 chunks mentioning that article,
+      append up to `extra_k` additional legal chunks that also mention the same article
+      (ordered by hybrid score descending).
+    """
+    if not reranked or not combined_candidates:
+        return reranked
+
+    article_no = _extract_first_article_number(query)
+    if not article_no:
+        for _doc_id, meta, _score in reranked:
+            article_no = _extract_first_article_number(str(meta.get("text", "") or ""))
+            if article_no:
+                break
+    if not article_no:
+        return reranked
+
+    current_mentions = sum(
+        1 for _doc_id, meta, _score in reranked if _mentions_article(str(meta.get("text", "") or ""), article_no)
+    )
+    if current_mentions >= 2:
+        return reranked
+
+    selected_ids = {doc_id for doc_id, _meta, _score in reranked}
+    anchor_source = None
+    for _doc_id, meta, _score in reranked:
+        text = str(meta.get("text", "") or "")
+        if _mentions_article(text, article_no):
+            anchor_source = str(meta.get("source", "") or "")
+            break
+
+    extras: list[tuple[str, dict, float]] = []
+    for doc_id, meta, score, coll_name in combined_candidates:
+        if coll_name != legal_collection_name:
+            continue
+        if doc_id in selected_ids:
+            continue
+        candidate_text = str(meta.get("text", "") or "")
+        same_article = _mentions_article(candidate_text, article_no)
+        same_source_follow_up = (
+            bool(anchor_source)
+            and str(meta.get("source", "") or "") == anchor_source
+            and _looks_like_follow_up_clause(candidate_text)
+        )
+        if not (same_article or same_source_follow_up):
+            continue
+        extras.append((doc_id, meta, score))
+
+    if not extras:
+        return reranked
+
+    extras.sort(key=lambda x: x[2], reverse=True)
+    return reranked + extras[: max(0, int(extra_k))]

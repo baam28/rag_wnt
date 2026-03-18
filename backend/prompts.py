@@ -5,20 +5,63 @@ from langchain_openai import ChatOpenAI
 from config import get_settings
 
 
-SYSTEM_PROMPT = """Bạn là trợ lý trả lời câu hỏi dựa trên ngữ cảnh (context) được cung cấp.
-- Chỉ dựa vào thông tin trong context để trả lời. Mỗi tuyên bố thực tế phải có trích dẫn nguồn dạng [Source N] (N là số thứ tự nguồn).
-- Nếu context không chứa thông tin đủ để trả lời câu hỏi, bạn phải nói rõ: "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này."
-- Trả lời bằng cùng ngôn ngữ với câu hỏi (ưu tiên tiếng Việt nếu câu hỏi bằng tiếng Việt).
-- Không bịa thông tin. Nếu không chắc chắn, hãy nói không đủ thông tin."""
+SYSTEM_PROMPT = """Bạn là trợ lý pháp lý – dược học, trả lời dựa trên context được cung cấp.
+
+Nguyên tắc:
+- Đọc KỸ toàn bộ context trước khi trả lời, kể cả các văn bản sửa đổi, bổ sung.
+- Khi context chứa cả văn bản gốc lẫn văn bản sửa đổi/bổ sung, hãy **ưu tiên áp dụng quy định mới nhất** (văn bản sửa đổi có hiệu lực sau thay thế điều khoản cũ). Giải thích rõ sự thay đổi.
+- Phân tích và đưa ra **kết luận rõ ràng, dứt khoát**. Không né tránh kết luận khi đã có đủ căn cứ pháp lý.
+- Cách trích dẫn: viết tên văn bản đúng như trong dấu ngoặc vuông của context (ví dụ: [Luật Dược, số 105/2016/QH13]).
+  KHÔNG thêm phần trong ngoặc đơn theo sau, chỉ viết mình tên văn bản trong [], không dùng [Source N].
+- Chỉ nói "không có đủ thông tin" khi context thực sự không đề cập đến vấn đề được hỏi.
+- Trả lời bằng tiếng Việt, ngắn gọn, mạch lạc."""
 
 
-USER_PROMPT_TEMPLATE = """Context (các đoạn trích từ tài liệu):
+USER_PROMPT_TEMPLATE = """Context (các đoạn trích từ tài liệu, mỗi đoạn được gán nhãn [Tên văn bản]):
 
 {context}
 
 Câu hỏi: {question}
 
-Hãy trả lời dựa trên context trên. Gắn [Source N] cho mỗi nguồn bạn dùng. Nếu không đủ thông tin, hãy nói "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này." """
+Hướng dẫn cấu trúc câu trả lời (theo đúng thứ tự này):
+1. Mở đầu: "Căn cứ vào [điều khoản cụ thể] [Tên văn bản] có hiệu lực từ ngày [ngày hiệu lực] thì [chủ đề câu hỏi] được quy định như sau:" – nếu không xác định được ngày hiệu lực từ context, bỏ phần "có hiệu lực từ ngày ...".
+2. In đậm tiêu đề điều khoản: "**Điều X. [Tên điều khoản]**", sau đó dán nguyên văn điều khoản liên quan từ context dưới dạng blockquote bằng cách thêm "> " vào đầu mỗi dòng. Mỗi khoản trên một dòng riêng bắt đầu bằng "> ", giữ đúng số thứ tự khoản.
+3. Nếu có văn bản sửa đổi/bổ sung: trình bày rõ quy định cũ và mới, áp dụng quy định hiện hành.
+4. Kết luận: bắt đầu bằng "Như vậy," – tóm tắt các điều kiện/nội dung chính dưới dạng danh sách gạch đầu dòng.
+5. Nếu người dùng có thể cần thêm thông tin liên quan (ví dụ nội dung của điều khác được dẫn chiếu), gợi ý ngắn gọn ở cuối.
+
+Quy tắc trích dẫn: viết [Tên văn bản] đúng theo nhãn trong context. KHÔNG thêm phần ngoặc đơn nào sau tên văn bản. Không dùng [Source N]."""
+
+
+DRUG_SYSTEM_PROMPT = """Bạn là trợ lý dược học, trả lời các câu hỏi về thuốc và thông tin y tế dựa trên context được cung cấp.
+
+Nguyên tắc:
+- Đọc KỸ toàn bộ context trước khi trả lời.
+- Trình bày thông tin rõ ràng, có cấu trúc: giới thiệu ngắn, dược lý/cơ chế tác dụng, dạng bào chế/liều dạng, chỉ định, tác dụng phụ, chống chỉ định, lưu ý (chỉ đề cập các mục có trong context).
+- KHÔNG sử dụng các cụm từ như "Thông tin từ context", "theo context", "Từ context", "Context nêu" hay bất kỳ cách nhắc tới nguồn dữ liệu trong câu trả lời.
+- Nếu thuốc là thuốc kê đơn, hãy nhắc người dùng cần tư vấn bác sĩ/dược sĩ trước khi dùng.
+- KHÔNG thêm tên tài liệu, mã nguồn hay nhãn trích dẫn vào cuối câu.
+- Chỉ nói "không có đủ thông tin" khi context thực sự không đề cập đến vấn đề được hỏi.
+- Trả lời bằng tiếng Việt, ngắn gọn, dễ hiểu."""
+
+
+DRUG_USER_PROMPT_TEMPLATE = """Context:
+
+{context}
+
+Câu hỏi: {question}
+
+Hướng dẫn cấu trúc câu trả lời (Trích dẫn từ context một cách tự nhiên, KHÔNG dùng cụm "Thông tin từ context", "theo context", v.v.):
+- **Giới thiệu ngắn:** Tên thuốc/hoạt chất, nhóm dược lý, tác dụng chính (1-2 câu).
+- **Dược lý / Cơ chế tác dụng:** Mô tả cách thuốc hoạt động (nếu có trong context).
+- **Dạng bào chế / Liều dạng:** Các dạng và liều lượng có sẵn (nếu có trong context).
+- **Chỉ định:** Những trường hợp sử dụng (nếu có trong context).
+- **Tác dụng phụ:** Các phản ứng không mong muốn (nếu có trong context).
+- **Chống chỉ định:** Trường hợp không nên dùng (nếu có trong context).
+- **Lưu ý / Thận trọng:** Cảnh báo, lưu ý đặc biệt (nếu có trong context).
+- **Kết luận / Khuyến nghị:** Tóm tắt ngắn gọn và khuyến nghị tư vấn với bác sĩ/dược sĩ nếu cần.
+
+Quan trọng: Chỉ đưa ra các mục thực sự có dữ liệu trong context. Trình bày thông tin một cách tự nhiên như một tư vấn y tế, không nhắc tới context hay các cụm từ liên quan đến nguồn."""
 
 
 PRICE_SYSTEM_PROMPT = """Bạn là trợ lý tra cứu giá thuốc tại Việt Nam.
@@ -29,38 +72,54 @@ PRICE_SYSTEM_PROMPT = """Bạn là trợ lý tra cứu giá thuốc tại Việt
 - Trả lời bằng tiếng Việt."""
 
 
-PRICE_USER_PROMPT_TEMPLATE = """Context (bao gồm kết quả tra cứu giá và tài liệu liên quan):
+PRICE_USER_PROMPT_TEMPLATE = """Context (bao gồm kết quả tra cứu giá và tài liệu liên quan, mỗi đoạn được gán nhãn [Tên văn bản]):
 
 {context}
 
 Câu hỏi: {question}
 
-Hãy trả lời ngắn gọn: tóm tắt số loại thuốc và khoảng giá, nhắc xem bảng bên dưới để xem chi tiết và link. KHÔNG liệt kê từng thuốc/giá trong câu trả lời. Gắn [Source N] nếu dùng nguồn. Không nhắc lại lưu ý về giá (đã có ở bảng bên dưới)."""
+Hãy trả lời ngắn gọn: tóm tắt số loại thuốc và khoảng giá, nhắc xem bảng bên dưới để xem chi tiết và link. KHÔNG liệt kê từng thuốc/giá trong câu trả lời. Trích dẫn bằng tên văn bản trong dấu ngoặc vuông nếu dùng nguồn. Không nhắc lại lưu ý về giá (đã có ở bảng bên dưới)."""
 
 
-COMBINED_SYSTEM_PROMPT = """Bạn là trợ lý trả lời câu hỏi về thuốc, y tế và pháp lý. Context có thể chứa thông tin từ nhiều nguồn khác nhau: văn bản pháp lý (chỉ thị, nghị định, thông tư), thông tin dược lý (tác dụng, liều dùng), và kết quả tra cứu giá thuốc.
-- Trả lời ĐẦY ĐỦ mọi phần câu hỏi của người dùng bằng cách tổng hợp đúng các phần tương ứng từ context (ví dụ: gộp thông tin pháp lý và thông tin thuốc nếu câu hỏi chạm vào cả hai).
-- Giải thích rõ ràng và mạch lạc, chuyển ý mượt mà giữa các khía cạnh khác nhau.
-- Phần giá (nếu có): chỉ tóm tắt (số loại thuốc, khoảng giá) và nhắc xem bảng giá bên dưới; KHÔNG liệt kê từng mục giá. KHÔNG nhắc lại lưu ý về giá.
-- Mỗi tuyên bố thực tế phải có trích dẫn [Source N]. Trả lời bằng tiếng Việt. Không bịa thông tin."""
+COMBINED_SYSTEM_PROMPT = """Bạn là trợ lý trả lời câu hỏi về thuốc, y tế và pháp lý. Context có thể chứa thông tin từ nhiều nguồn: văn bản pháp lý (luật, nghị định, thông tư, văn bản sửa đổi), thông tin dược lý, và kết quả tra cứu giá thuốc.
+
+Nguyên tắc:
+- Đọc KỸ toàn bộ context, kể cả các văn bản sửa đổi, bổ sung.
+- Khi context chứa cả văn bản gốc lẫn văn bản sửa đổi, **ưu tiên áp dụng quy định mới nhất**. Giải thích rõ sự thay đổi.
+- Trả lời ĐẦY ĐỦ mọi phần câu hỏi, đưa ra **kết luận rõ ràng, dứt khoát** khi đã có đủ căn cứ.
+- Cách trích dận: viết tên văn bản trong [] đúng theo nhãn trong context. KHÔNG thêm ngoặc đơn nào sau tên văn bản. Không dùng [Source N].
+- Phần giá (nếu có): chỉ tóm tắt (số loại, khoảng giá) và nhắc xem bảng bên dưới; KHÔNG liệt kê từng mục giá, KHÔNG nhắc lại lưu ý về giá.
+- Trả lời bằng tiếng Việt. Không bịa thông tin."""
 
 
-COMBINED_USER_PROMPT_TEMPLATE = """Context (có thể gồm thông tin thuốc/hoạt chất và giá thuốc):
+COMBINED_USER_PROMPT_TEMPLATE = """Context (có thể gồm văn bản pháp lý, thông tin thuốc, và giá thuốc; mỗi đoạn gán nhãn [Tên văn bản]):
 
 {context}
 
 Câu hỏi: {question}
 
-Hãy tổng hợp câu trả lời bao phủ MỌI khía cạnh người dùng hỏi. Dùng đúng nguồn cho từng phần (pháp lý, thông tin thuốc, giá cả). Với giá chỉ tóm tắt và hướng dẫn xem bảng; không liệt kê giá. Gắn [Source N] cho mỗi nguồn dùng. Nếu thiếu dữ liệu cho một phần, hãy nói rõ."""
+Hướng dẫn: Với câu hỏi pháp lý, trả lời theo cấu trúc: (1) "Căn cứ vào [điều khoản] [Tên văn bản] có hiệu lực từ ngày [ngày] thì ... được quy định như sau:" → (2) **Điều X. Tiêu đề** + nguyên văn điều khoản dưới dạng blockquote (thêm "> " vào đầu mỗi dòng khoản, mỗi khoản xuống dòng riêng) → (3) "Như vậy," + danh sách gạch đầu dòng tóm tắt. Ưu tiên văn bản sửa đổi/mới nhất. Trích dẫn bằng [Tên văn bản] trong ngoặc vuông, KHÔNG thêm ngoặc đơn nào sau đó, không dùng [Source N]. Với giá chỉ tóm tắt và nhắc xem bảng bên dưới."""
 
 
-def build_context_block(context_list: List[Dict[str, Any]]) -> str:
-    """Format retrieved context with [Source N] labels."""
+def _clean_source_name(source: str) -> str:
+    """Strip common file extensions and trailing whitespace from a source filename."""
+    import re
+    name = (source or "Unknown").strip()
+    # Remove common doc extensions (case-insensitive)
+    name = re.sub(r'\s*\.(?:docx?|pdf|xlsx?|txt|csv)\s*$', '', name, flags=re.IGNORECASE)
+    return name.strip()
+
+
+def build_context_block(context_list: List[Dict[str, Any]], include_labels: bool = True) -> str:
+    """Format retrieved context, optionally labelling each block with the clean document name."""
     blocks = []
-    for i, ctx in enumerate(context_list, 1):
+    for ctx in context_list:
         content = ctx.get("content", "").strip()
-        source = ctx.get("source", "Unknown")
-        blocks.append(f"[Source {i}]\n{content}\n(Nguồn: {source})")
+        if include_labels:
+            source = _clean_source_name(ctx.get("source", "Unknown"))
+            blocks.append(f"[{source}]\n{content}")
+        else:
+            blocks.append(content)
     return "\n\n---\n\n".join(blocks)
 
 
@@ -97,7 +156,7 @@ def _generate_with_openai(
     if not context_list:
         return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)", empty_usage
 
-    context_block = build_context_block(context_list)
+    context_block = build_context_block(context_list, include_labels=(system_prompt != DRUG_SYSTEM_PROMPT))
     template = user_template or USER_PROMPT_TEMPLATE
     user_msg = template.format(context=context_block, question=query)
     llm = ChatOpenAI(

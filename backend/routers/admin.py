@@ -29,7 +29,7 @@ from mongo_client import (
     get_chat_sessions_collection,
     get_chat_messages_collection,
 )
-from utils import get_qdrant_client
+from utils import get_qdrant_client, reset_qdrant_client
 from llm_usage import get_usage
 
 router = APIRouter(tags=["admin"])
@@ -90,6 +90,21 @@ def submit_feedback(req: FeedbackRequest):
         data = _load_feedback()
         data.append(entry)
         _save_feedback(data)
+
+    # Persist feedback onto the message document in MongoDB so it survives reload
+    if req.session_id and req.answer:
+        try:
+            get_chat_messages_collection().update_one(
+                {
+                    "session_id": req.session_id,
+                    "role": "assistant",
+                    "content": req.answer,
+                },
+                {"$set": {"feedback": req.rating, "feedbackComment": req.comment or ""}},
+            )
+        except Exception:
+            pass  # Non-fatal: feedback.json already captured it
+
     return {"status": "ok"}
 
 
@@ -317,6 +332,7 @@ def clear_db(current_user: CurrentUser = Depends(get_current_admin)):
     settings = get_settings()
     db_path = Path(settings.persist_dir)
     try:
+        reset_qdrant_client(settings.persist_dir)
         if db_path.exists():
             shutil.rmtree(db_path)
         db_path.mkdir(parents=True, exist_ok=True)

@@ -1,9 +1,7 @@
-"""Heuristic intent classifier — used as fallback when the LLM supervisor fails.
-
-Renamed from ``router.py`` to avoid confusion with FastAPI routers.
+"""Heuristic intent classifier — kept for reference but no longer used in the main flow.
 
 Emits the same schema as supervisor.get_intent_from_supervisor:
-  {"collections_to_search": ["legal" | "drug_info"], "price": bool, "price_name": str | None}
+  {"collections_to_search": ["legal" | "drug"], "price": bool, "price_name": str | None}
 """
 
 import re
@@ -31,7 +29,7 @@ def classify_intent(question: str) -> dict[str, Any]:
     """Classify intent using keyword heuristics.
 
     Returns:
-        {"collections_to_search": ["legal"|"drug_info"], "price": bool, "price_name": str|None}
+        {"collections_to_search": ["legal"|"drug"], "price": bool, "price_name": str|None}
     """
     q = question.strip()
 
@@ -42,7 +40,7 @@ def classify_intent(question: str) -> dict[str, Any]:
     if _LEGAL_KEYWORDS.search(q):
         collections = ["legal"]
     else:
-        collections = ["drug_info"]
+        collections = ["drug"]
 
     return {
         "collections_to_search": collections,

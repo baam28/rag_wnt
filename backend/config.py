@@ -45,10 +45,13 @@ class Settings(BaseSettings):
     # Set to 0 to merge ALL collections.
     retrieve_top_k_collections: int = 1
 
+    # Whether to apply context-aware rescoring after retrieval
+    enable_context_rescore: bool = True
+
     # Fixed collection names for the two domain-specific RAG agents.
     # Override in .env if your Qdrant collection names differ.
     legal_collection_name: str = "legal"
-    drug_info_collection_name: str = "drug"
+    drug_collection_name: str = "drug"
 
     # MongoDB & auth
     mongo_uri: str = "mongodb://localhost:27017"

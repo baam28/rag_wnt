@@ -17,6 +17,15 @@ const ANALYTICS_METRICS = [
   { key: 'api_usage', label: 'API usage (tokens)', dataKey: 'api_usage', title: 'API usage (tokens) theo ngày', color: '#0d9488' },
 ];
 
+const COLLECTION_LABELS = {
+  drug: "Dược phẩm",
+  legal: "Văn bản pháp lý",
+};
+
+function getCollectionLabel(name) {
+  return COLLECTION_LABELS[name] || name;
+}
+
 function AdminPage({
 
   state,
@@ -146,11 +155,23 @@ function AdminPage({
     <>
 
       <section className="main-panel main-panel--admin" style={{ display: "flex", flexDirection: "column" }}>
-        <div className="admin-tabs" style={{ display: "flex", gap: "1rem", marginBottom: "1.5rem", borderBottom: "1px solid #e5e7eb", paddingBottom: "0.5rem", flexShrink: 0 }}>
-          <button className={`btn ${activeTab === "analytics" ? "btn-primary" : "btn-ghost"}`} onClick={() => setActiveTab("analytics")}>Thống kê</button>
-          <button className={`btn ${activeTab === "users" ? "btn-primary" : "btn-ghost"}`} onClick={() => setActiveTab("users")}>Quản lý User</button>
-          <button className={`btn ${activeTab === "docs" ? "btn-primary" : "btn-ghost"}`} onClick={() => setActiveTab("docs")}>Tài liệu & DB</button>
-          <button className={`btn ${activeTab === "feedback" ? "btn-primary" : "btn-ghost"}`} onClick={() => setActiveTab("feedback")}>Đánh giá</button>
+        <div className="admin-tabs" style={{ flexShrink: 0 }}>
+          <button className={"admin-tab" + (activeTab === "analytics" ? " active" : "")} onClick={() => setActiveTab("analytics")}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            Thống kê
+          </button>
+          <button className={"admin-tab" + (activeTab === "users" ? " active" : "")} onClick={() => setActiveTab("users")}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Quản lý User
+          </button>
+          <button className={"admin-tab" + (activeTab === "docs" ? " active" : "")} onClick={() => setActiveTab("docs")}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            Tài liệu & DB
+          </button>
+          <button className={"admin-tab" + (activeTab === "feedback" ? " active" : "")} onClick={() => setActiveTab("feedback")}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z"/><path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>
+            Đánh giá
+          </button>
         </div>
 
         <div style={{ flex: 1, overflowY: "auto", paddingRight: "0.5rem", paddingBottom: "2rem" }}>
@@ -359,8 +380,9 @@ function AdminPage({
                   onChange={(e) => setCollectionName(e.target.value)}
                   aria-label="Chọn collection"
                 >
-                  <option value="drug">drug — Thông tin dược phẩm</option>
-                  <option value="legal">legal — Văn bản pháp lý</option>
+                  {Object.entries(COLLECTION_LABELS).map(([value, label]) => (
+                    <option key={value} value={value}>{label}</option>
+                  ))}
                 </select>
               </div>
               <div className="admin-field">
@@ -487,18 +509,8 @@ function AdminPage({
                     }}
                   >
                     <div className="admin-collection-name">
-                      {c.name}
+                      {getCollectionLabel(c.name)}
                     </div>
-                    <button
-                      className="btn btn-danger btn-sm"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteCollection(c.name);
-                      }}
-                      title={`Xóa collection "${c.name}"`}
-                    >
-                      Xóa
-                    </button>
                   </div>
                   {selectedCollection === c.name && (
                     <div className="admin-collection-body">
@@ -726,4 +738,3 @@ function AdminPage({
 }
 
 export default AdminPage;
-

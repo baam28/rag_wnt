@@ -1,8 +1,8 @@
-"""Domain agents: price scraper + two RAG agents (legal and drug_info).
+"""Domain agents: price scraper + two RAG agents (legal and drug).
 
 Intent routing
 --------------
-The supervisor emits {"collections_to_search": ["legal", "drug_info"], "price": bool, "price_name": str|None}.
+The supervisor emits {"collections_to_search": ["legal", "drug"], "price": bool, "price_name": str|None}.
   - run_price_agent         → always called when intent["price"] is True
   - run_federated_rag_agent → searches across all provided collections simultaneously
 

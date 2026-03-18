@@ -63,6 +63,14 @@ function App() {
   const [currentJobId, setCurrentJobId] = useState(null);
   const [skipSummary, setSkipSummary] = useState(false);
   const ingestPollRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const inFlightControllersRef = useRef(new Map());
+  const sendLockRef = useRef(false);
+  const activeRequestIdRef = useRef(0);
+  const pendingQuestionRef = useRef("");
+  const pendingBaseMessagesRef = useRef([]);
+  const pendingSessionIdRef = useRef(null);
+  const cancelAnimRef = useRef(false);
 
   const [isClearingDb, setIsClearingDb] = useState(false);
   const [clearDbStatus, setClearDbStatus] = useState("");
@@ -264,26 +272,30 @@ function App() {
 
   async function handleSelectSession(id) {
     const s = sessions.find((x) => x.id === id);
+    cancelInFlight({ restoreInput: false });
     setActiveSessionId(id);
+    setMessages(s?.messages || []);
+    setQuestion("");
+    setAskError("");
 
-    if (jwtToken && s && s.messages.length === 0) {
+    // Always try to fetch fresh messages from server when switching sessions
+    if (jwtToken) {
       try {
         const mResp = await authFetch(`${API_BASE}/chat/sessions/${id}/messages`);
         if (mResp.ok) {
           const msgs = await mResp.json();
-          const fetchedMessages = msgs.map((m) => ({ 
-            role: m.role, 
+          const fetchedMessages = msgs.map((m) => ({
+            role: m.role,
             content: m.content,
             sources: m.sources,
             priceData: m.priceData,
             feedback: m.feedback,
-            feedbackComment: m.feedbackComment
+            feedbackComment: m.feedbackComment,
           }));
           setMessages(fetchedMessages);
-          setSessions((prev) => 
+          setSessions((prev) =>
             prev.map((x) => (x.id === id ? { ...x, messages: fetchedMessages } : x))
           );
-          setAskError("");
           return;
         }
       } catch (err) {
@@ -291,11 +303,12 @@ function App() {
       }
     }
 
+    // Fallback to in-memory messages
     setMessages(s?.messages || []);
-    setAskError("");
   }
 
   function handleNewSession() {
+    cancelInFlight({ restoreInput: false });
     const id = Math.random().toString(36).slice(2, 10);
     const now = new Date().toISOString();
     const newSession = {
@@ -311,13 +324,25 @@ function App() {
     setAskError("");
   }
 
-  function handleDeleteSession(id) {
+  async function handleDeleteSession(id) {
+    if (activeSessionId === id) {
+      cancelInFlight({ restoreInput: false });
+    }
+    // Optimistic UI update first
     setSessions((prev) => prev.filter((s) => s.id !== id));
     if (activeSessionId === id) {
       const remaining = sessions.filter((s) => s.id !== id);
       const next = remaining[0] || null;
       setActiveSessionId(next ? next.id : null);
       setMessages(next ? next.messages || [] : []);
+    }
+    // Persist deletion on the server
+    if (jwtToken) {
+      try {
+        await authFetch(`${API_BASE}/chat/sessions/${id}`, { method: "DELETE" });
+      } catch (err) {
+        console.error("Failed to delete session on server:", err);
+      }
     }
   }
 
@@ -345,17 +370,57 @@ function App() {
     );
   }
 
+  function cancelInFlight({ restoreInput = false } = {}) {
+    activeRequestIdRef.current += 1;
+    cancelAnimRef.current = true;
+    for (const [, ctrl] of inFlightControllersRef.current) {
+      try {
+        ctrl.abort();
+      } catch {}
+    }
+    inFlightControllersRef.current.clear();
+    sendLockRef.current = false;
+    abortControllerRef.current = null;
+
+    const q = pendingQuestionRef.current || "";
+    const base = Array.isArray(pendingBaseMessagesRef.current) ? pendingBaseMessagesRef.current : [];
+    const pendingSessionId = pendingSessionIdRef.current;
+    pendingQuestionRef.current = "";
+    pendingBaseMessagesRef.current = [];
+    pendingSessionIdRef.current = null;
+    setAskError("");
+    setIsSending(false);
+
+    if (restoreInput) {
+      setQuestion(q);
+      updateActiveSessionMessages(pendingSessionId || activeSessionId, base);
+    } else {
+      setQuestion("");
+    }
+  }
+
   async function handleSend(e) {
     e.preventDefault();
-    if (!question.trim() || isSending) return;
+    if (!question.trim() || isSending || abortControllerRef.current || sendLockRef.current) return;
+    sendLockRef.current = true;
     setAskError("");
 
+    const requestId = ++activeRequestIdRef.current;
+    const originalQuestion = question.trim();
+    pendingQuestionRef.current = originalQuestion;
+    pendingBaseMessagesRef.current = [...messages];
+    cancelAnimRef.current = false;
+
     const sid = ensureActiveSession();
-    const userMsg = { role: "user", content: question.trim() };
+    pendingSessionIdRef.current = sid;
+    const userMsg = { role: "user", content: originalQuestion };
     const nextMessages = [...messages, userMsg];
     updateActiveSessionMessages(sid, nextMessages);
     setQuestion("");
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    inFlightControllersRef.current.set(requestId, controller);
     setIsSending(true);
     try {
       // Build short history window for API (/ask)
@@ -373,23 +438,48 @@ function App() {
           history,
           session_id: sid,
         }),
+        signal: controller.signal,
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `Request failed with ${resp.status}`);
       }
+      if (requestId !== activeRequestIdRef.current) return;
       const data = await resp.json();
+      if (requestId !== activeRequestIdRef.current) return;
       const fullText = data.answer || "";
       const sources = data.sources || [];
       const priceData = data.price_data || null;
 
-      await animateAnswer(sid, nextMessages, fullText, sources, priceData);
+      if (!cancelAnimRef.current && requestId === activeRequestIdRef.current) {
+        await animateAnswer(sid, nextMessages, fullText, sources, priceData);
+      }
     } catch (err) {
+      if (requestId !== activeRequestIdRef.current) return;
+      if (err.name === "AbortError" || controller.signal.aborted) {
+        // cancelled — question already restored by handleCancel
+        return;
+      }
       console.error(err);
       setAskError(String(err));
     } finally {
-      setIsSending(false);
+      inFlightControllersRef.current.delete(requestId);
+      if (requestId === activeRequestIdRef.current && abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+        setIsSending(false);
+      }
+      if (requestId === activeRequestIdRef.current) {
+        sendLockRef.current = false;
+      }
     }
+  }
+
+  function handleCancel(e) {
+    if (e) {
+      e.preventDefault?.();
+      e.stopPropagation?.();
+    }
+    cancelInFlight({ restoreInput: true });
   }
 
   function animateAnswer(sessionId, baseMessages, fullText, sources, priceData) {
@@ -411,6 +501,10 @@ function App() {
       const step = Math.max(1, Math.floor(total / 80));
 
       function tick() {
+        if (cancelAnimRef.current) {
+          resolve();
+          return;
+        }
         i += step;
         if (i >= total) i = total;
         currentMessages = currentMessages.map((m, idx) =>
@@ -672,46 +766,44 @@ function App() {
     <div className="app-shell">
       <header className="top-nav">
         <div className="top-nav-left">
-          <div className="brand-badge">WN</div>
+          <div className="brand-badge">
+            <img src={import.meta.env.BASE_URL + "logo.jpg"} alt="PharmaAI" />
+          </div>
           <div>
-            <div className="brand-text-main">Web Nhà Thuốc Chatbot</div>
-            <div className="brand-text-sub">
-              Trợ lý hỏi đáp tài liệu 
-            </div>
+            <div className="brand-text-main">PharmaAI</div>
+            <div className="brand-text-sub">Trợ lý dược thông minh</div>
           </div>
         </div>
         <div className="top-nav-right">
-          {jwtToken && !isAdmin && (
-            <>
-            </>
-          )}
-          {!jwtToken ? null : (
-            <>
-              <span className="user-info" style={{ marginLeft: "0.5rem" }}>
-                <button
-                  className={"btn btn-ghost btn-sm" + (route === "account" ? " pill" : "")}
-                  type="button"
-                  onClick={() => {
-                    setRoute("account");
-                    if (!window.location.pathname.startsWith("/account")) {
-                      window.history.replaceState(null, "", "/account/");
-                    }
-                  }}
-                  title="Quản lý tài khoản"
-                >
-                  {username}
-                </button>
-              </span>
+          {jwtToken && (
+            <div className="nav-user-wrap">
               <button
-                className="btn btn-ghost btn-sm"
+                className="nav-user-btn"
+                type="button"
+                onClick={() => {
+                  setRoute("account");
+                  window.history.replaceState(null, "", "/account/");
+                }}
+                title="Quản lý tài khoản"
+              >
+                <span className="nav-user-avatar">
+                  {(username || "U").charAt(0).toUpperCase()}
+                </span>
+                <span className="nav-user-name">{username}</span>
+              </button>
+              <button
+                className="nav-logout-btn"
                 type="button"
                 onClick={handleLogout}
-                style={{ marginLeft: "0.5rem" }}
                 title="Đăng xuất"
               >
-                Đăng xuất
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                  <polyline points="16 17 21 12 16 7"/>
+                  <line x1="21" y1="12" x2="9" y2="12"/>
+                </svg>
               </button>
-            </>
+            </div>
           )}
         </div>
       </header>
@@ -823,6 +915,7 @@ function App() {
             onSelectSession={handleSelectSession}
             onDeleteSession={handleDeleteSession}
             onSend={handleSend}
+            onCancel={handleCancel}
             onFeedback={handleFeedback}
             question={question}
             setQuestion={setQuestion}
@@ -909,15 +1002,35 @@ function DocViewerModal({ source, contents, pages, onClose }) {
   );
 }
 
+const DISLIKE_REASONS = [
+  "Thông tin không chính xác",
+  "Không liên quan",
+  "Thiếu thông tin",
+  "Câu trả lời khó hiểu",
+  "Khác",
+];
+
 export function MessageBubble({ message, onFeedback }) {
   const [showSources, setShowSources] = useState(false);
   const [expandedSource, setExpandedSource] = useState(null);
   const [expandedDrugs, setExpandedDrugs] = useState(new Set());
   const [viewerSource, setViewerSource] = useState(null);
   const [feedbackComment, setFeedbackComment] = useState("");
+  const [feedbackReason, setFeedbackReason] = useState("");
   const [showFeedbackForm, setShowFeedbackForm] = useState(false);
   const [feedbackSending, setFeedbackSending] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [localFeedback, setLocalFeedback] = useState(message.feedback || null);
   const isUser = message.role === "user";
+
+  // Sync if parent prop changes (e.g. after session reload)
+  const prevFeedbackRef = React.useRef(message.feedback);
+  if (message.feedback !== prevFeedbackRef.current) {
+    prevFeedbackRef.current = message.feedback;
+    if (message.feedback && message.feedback !== localFeedback) {
+      setLocalFeedback(message.feedback);
+    }
+  }
 
   const toggleDrugExpand = (drugName) => {
     setExpandedDrugs((prev) => {
@@ -931,35 +1044,176 @@ export function MessageBubble({ message, onFeedback }) {
   const uniqueSources = hasSources ? deduplicateSources(message.sources) : [];
 
   const handleRate = (rating) => {
-    if (message.feedback === rating) return;
+    if (localFeedback === rating) return;
     if (rating === "down") {
+      setFeedbackReason("");
+      setFeedbackComment("");
       setShowFeedbackForm(true);
       return;
     }
     setShowFeedbackForm(false);
+    setLocalFeedback(rating);
     onFeedback && onFeedback(rating, "");
   };
 
+  const handleCopy = () => {
+    const text = message.content || "";
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  };
+
   const handleSubmitFeedback = () => {
-    onFeedback && onFeedback("down", feedbackComment);
+    const combined = [feedbackReason, feedbackComment].filter(Boolean).join(" — ");
+    setLocalFeedback("down");
+    onFeedback && onFeedback("down", combined);
     setShowFeedbackForm(false);
   };
 
   const handleSkipFeedback = () => {
+    setLocalFeedback("down");
     onFeedback && onFeedback("down", "");
     setShowFeedbackForm(false);
   };
 
-  const formatAssistantText = (text) => {
-    if (!text) return "";
-    let html = text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-    html = html.replace(/\s*\[Source\s*\d+\]/gi, "");
-    html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    html = html.replace(/\n/g, "<br/>");
-    return html;
+  const formatAssistantText = (rawText) => {
+    if (!rawText) return "";
+
+    const esc = (s) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    // Render [Citation name] as a styled inline chip (not a link, since no URL)
+    const renderCitations = (s) =>
+      s.replace(/\[([^\]]+)\]/g, '<cite class="chat-cite">$1</cite>');
+
+    const inline = (s) =>
+      renderCitations(
+        s
+          .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
+          .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+          .replace(/\*([^*\n]+?)\*/g, "<em>$1</em>")
+          .replace(/`([^`]+)`/g, '<code class="chat-icode">$1</code>')
+      );
+
+    // No longer strip [Source N] — citations now use doc names
+    const text = rawText.trimEnd();
+    const lines = text.split("\n");
+    const out = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const raw = lines[i];
+      const trimmed = raw.trim();
+
+      // Fenced code block
+      if (trimmed.startsWith("```")) {
+        const lang = trimmed.slice(3).trim();
+        i++;
+        const codeLines = [];
+        while (i < lines.length && !lines[i].trim().startsWith("```")) {
+          codeLines.push(esc(lines[i]));
+          i++;
+        }
+        if (i < lines.length) i++;
+        const langAttr = lang ? ` data-lang="${esc(lang)}"` : "";
+        out.push(`<pre class="chat-code"${langAttr}><code>${codeLines.join("\n")}</code></pre>`);
+        continue;
+      }
+
+      // Horizontal rule
+      if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+        out.push("<hr/>");
+        i++;
+        continue;
+      }
+
+      // Headings
+      const hm = raw.match(/^(#{1,3}) (.+)/);
+      if (hm) {
+        const lvl = hm[1].length;
+        out.push(`<h${lvl} class="chat-h${lvl}">${inline(esc(hm[2].trim()))}</h${lvl}>`);
+        i++;
+        continue;
+      }
+
+      // Blockquote
+      if (/^> ?/.test(raw)) {
+        const qLines = [];
+        while (i < lines.length && /^> ?/.test(lines[i])) {
+          qLines.push(inline(esc(lines[i].replace(/^> ?/, ""))));
+          i++;
+        }
+        out.push(`<blockquote class="chat-bq">${qLines.join("<br/>")}</blockquote>`);
+        continue;
+      }
+
+      // Unordered list
+      if (/^[ \t]*[-*+] /.test(raw)) {
+        const items = [];
+        while (i < lines.length && /^[ \t]*[-*+] /.test(lines[i])) {
+          items.push(`<li>${inline(esc(lines[i].replace(/^[ \t]*[-*+] /, "")))}</li>`);
+          i++;
+        }
+        out.push(`<ul class="chat-ul">${items.join("")}</ul>`);
+        continue;
+      }
+
+      // Ordered list
+      if (/^[ \t]*\d+[.)]\s/.test(raw)) {
+        const items = [];
+        while (i < lines.length && /^[ \t]*\d+[.)]\s/.test(lines[i])) {
+          items.push(`<li>${inline(esc(lines[i].replace(/^[ \t]*\d+[.)]\s+/, "")))}</li>`);
+          i++;
+        }
+        out.push(`<ol class="chat-ol">${items.join("")}</ol>`);
+        continue;
+      }
+
+      // Table
+      if (/^\|/.test(raw)) {
+        const tLines = [];
+        while (i < lines.length && /^\|/.test(lines[i])) {
+          tLines.push(lines[i]);
+          i++;
+        }
+        if (tLines.length >= 2) {
+          const parseRow = (row) => row.split("|").slice(1, -1).map((c) => c.trim());
+          const hCells = parseRow(tLines[0]).map((c) => `<th>${inline(esc(c))}</th>`).join("");
+          const bodyRows = tLines
+            .slice(2)
+            .map((r) => `<tr>${parseRow(r).map((c) => `<td>${inline(esc(c))}</td>`).join("")}</tr>`)
+            .join("");
+          out.push(`<table class="chat-table"><thead><tr>${hCells}</tr></thead><tbody>${bodyRows}</tbody></table>`);
+        } else {
+          tLines.forEach((l) => out.push(`<p>${inline(esc(l))}</p>`));
+        }
+        continue;
+      }
+
+      // Empty line
+      if (trimmed === "") { i++; continue; }
+
+      // Paragraph: group consecutive plain lines
+      const pLines = [];
+      while (
+        i < lines.length &&
+        lines[i].trim() !== "" &&
+        !/^[ \t]*```/.test(lines[i]) &&
+        !/^(#{1,3}) /.test(lines[i]) &&
+        !/^> ?/.test(lines[i]) &&
+        !/^[ \t]*[-*+] /.test(lines[i]) &&
+        !/^[ \t]*\d+[.)]\s/.test(lines[i]) &&
+        !/^\|/.test(lines[i]) &&
+        !/^(-{3,}|\*{3,}|_{3,})$/.test(lines[i].trim())
+      ) {
+        pLines.push(inline(esc(lines[i])));
+        i++;
+      }
+      if (pLines.length) out.push(`<p>${pLines.join("<br/>")}</p>`);
+    }
+
+    return out.join("");
   };
 
   const toggleSource = (idx) => {
@@ -983,6 +1237,7 @@ export function MessageBubble({ message, onFeedback }) {
         <div>{message.content}</div>
       ) : (
         <div
+          className="chat-prose"
           dangerouslySetInnerHTML={{ __html: formatAssistantText(message.content) }}
         />
       )}
@@ -1061,13 +1316,6 @@ export function MessageBubble({ message, onFeedback }) {
       )}
       {!isUser && hasSources && (
         <>
-          <div
-            className="sources-badge"
-            onClick={() => setShowSources((prev) => !prev)}
-          >
-            Nguồn tham khảo ({uniqueSources.length} tài liệu){" "}
-            <span>{showSources ? "▲" : "▼"}</span>
-          </div>
           {showSources && (
             <div className="sources-panel">
               {uniqueSources.map((s, idx) => (
@@ -1125,37 +1373,105 @@ export function MessageBubble({ message, onFeedback }) {
         <div className="feedback-row">
           <button
             type="button"
-            className={"feedback-btn" + (message.feedback === "up" ? " active-up" : "")}
-            onClick={() => handleRate("up")}
-            title="Hữu ích"
+            className={"feedback-action-btn copy-btn" + (copied ? " copied" : "")}
+            onClick={handleCopy}
+            title="Sao chép câu trả lời"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
-            </svg>
+            {copied ? (
+              <>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                Đã sao chép
+              </>
+            ) : (
+              <>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+                Sao chép
+              </>
+            )}
           </button>
-          <button
-            type="button"
-            className={"feedback-btn" + (message.feedback === "down" ? " active-down" : "")}
-            onClick={() => handleRate("down")}
-            title="Chưa tốt"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10zM17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
-            </svg>
-          </button>
-          {message.feedback && (
-            <span className="feedback-label">
-              {message.feedback === "up" ? "Cảm ơn!" : "Đã ghi nhận"}
-            </span>
+          <div className="feedback-divider" />
+          {localFeedback ? (
+            <div className={"feedback-rated " + (localFeedback === "up" ? "feedback-rated--up" : "feedback-rated--down")}>
+              {localFeedback === "up" ? (
+                <>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                    <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+                  </svg>
+                  Hữu ích
+                </>
+              ) : (
+                <>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                    <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10zM17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
+                  </svg>
+                  Đã ghi nhận
+                </>
+              )}
+            </div>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="feedback-action-btn"
+                onClick={() => handleRate("up")}
+                title="Hữu ích"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+                </svg>
+                Hữu ích
+              </button>
+              <button
+                type="button"
+                className="feedback-action-btn down-btn"
+                onClick={() => handleRate("down")}
+                title="Chưa tốt"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10zM17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
+                </svg>
+                Chưa tốt
+              </button>
+            </>
           )}
         </div>
       )}
       {showFeedbackForm && (
         <div className="feedback-form">
+          <div className="feedback-form-header">
+            <span className="feedback-form-title">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3H10zM17 2h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
+              </svg>
+              Điều gì chưa tốt?
+            </span>
+            <button type="button" className="feedback-form-close" onClick={handleSkipFeedback} title="Đóng">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+          <div className="feedback-reasons">
+            {DISLIKE_REASONS.map((r) => (
+              <button
+                key={r}
+                type="button"
+                className={"feedback-reason-chip" + (feedbackReason === r ? " selected" : "")}
+                onClick={() => setFeedbackReason(feedbackReason === r ? "" : r)}
+              >
+                {r}
+              </button>
+            ))}
+          </div>
           <textarea
             className="feedback-textarea"
             rows="2"
-            placeholder="Góp ý thêm (không bắt buộc)..."
+            placeholder="Mô tả thêm (không bắt buộc)..."
             value={feedbackComment}
             onChange={(e) => setFeedbackComment(e.target.value)}
           />
@@ -1165,7 +1481,7 @@ export function MessageBubble({ message, onFeedback }) {
               className="btn btn-primary btn-sm"
               onClick={handleSubmitFeedback}
             >
-              Gửi góp ý
+              Gửi phản hồi
             </button>
             <button
               type="button"
@@ -1295,4 +1611,3 @@ function UserAccountPage({ username, onLogout, onBack }) {
     </div>
   );
 }
-

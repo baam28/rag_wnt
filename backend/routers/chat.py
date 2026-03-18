@@ -24,6 +24,10 @@ from mongo_client import (
 )
 from prompts import (
     generate_answer,
+    SYSTEM_PROMPT,
+    USER_PROMPT_TEMPLATE,
+    DRUG_SYSTEM_PROMPT,
+    DRUG_USER_PROMPT_TEMPLATE,
     PRICE_SYSTEM_PROMPT,
     PRICE_USER_PROMPT_TEMPLATE,
     COMBINED_SYSTEM_PROMPT,
@@ -77,6 +81,18 @@ def list_chat_sessions(current_user: CurrentUser = Depends(get_current_user)):
     ]
 
 
+@router.delete("/chat/sessions/{session_id}", status_code=204)
+def delete_chat_session(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    sess_coll = get_chat_sessions_collection()
+    result = sess_coll.delete_one({"_id": session_id, "user_id": current_user.id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Session not found")
+    get_chat_messages_collection().delete_many({"session_id": session_id, "user_id": current_user.id})
+
+
 @router.get("/chat/sessions/{session_id}/messages", response_model=list[ChatMessageOut])
 def get_chat_messages(
     session_id: str,
@@ -126,13 +142,13 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         price_data, price_ctx = run_price_agent(req.question, intent)
 
         # 2. RAG agent — routed by intent["collections_to_search"]
-        collections = intent.get("collections_to_search", ["drug_info"])
+        collections = intent.get("collections_to_search", ["drug"])
         physical_collections = []
         for c in collections:
             if c == "legal":
                 physical_collections.append(settings.legal_collection_name)
-            elif c == "drug_info":
-                physical_collections.append(settings.drug_info_collection_name)
+            elif c == "drug":
+                physical_collections.append(settings.drug_collection_name)
                 
         if physical_collections:
             rag_docs = run_federated_rag_agent(req.question, physical_collections, history=history_payload)
@@ -147,15 +163,24 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         # 4. Choose prompt template
         has_rag = bool(rag_docs)
         has_price = price_ctx is not None
+        is_legal_only = collections == ["legal"] or physical_collections == [settings.legal_collection_name]
+        is_drug_only = not has_price and (collections == ["drug"] or physical_collections == [settings.drug_collection_name])
         if has_rag and has_price:
             system_prompt = COMBINED_SYSTEM_PROMPT
             user_template = COMBINED_USER_PROMPT_TEMPLATE
         elif has_price:
             system_prompt = PRICE_SYSTEM_PROMPT
             user_template = PRICE_USER_PROMPT_TEMPLATE
+        elif is_legal_only:
+            system_prompt = SYSTEM_PROMPT
+            user_template = USER_PROMPT_TEMPLATE
+        elif is_drug_only:
+            system_prompt = DRUG_SYSTEM_PROMPT
+            user_template = DRUG_USER_PROMPT_TEMPLATE
         else:
-            system_prompt = None
-            user_template = None
+            # mixed legal+drug without price
+            system_prompt = COMBINED_SYSTEM_PROMPT
+            user_template = COMBINED_USER_PROMPT_TEMPLATE
 
         answer, usage = generate_answer(req.question, final_contexts, history=history_payload, system_prompt=system_prompt, user_template=user_template)
         record_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0))

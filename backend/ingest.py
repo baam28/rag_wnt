@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import tiktoken
-from docling.document_converter import DocumentConverter  # type: ignore[import-untyped]
+from docling.document_converter import DocumentConverter 
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings

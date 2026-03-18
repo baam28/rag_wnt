@@ -85,7 +85,7 @@ class ChatMessageOut(BaseModel):
     created_at: str
     sources: Optional[list[dict[str, Any]]] = None
     priceData: Optional[dict[str, Any]] = None
-    feedback: Optional[int] = None
+    feedback: Optional[str] = None
     feedbackComment: Optional[str] = None
 
 
@@ -100,6 +100,7 @@ class DocumentInfo(BaseModel):
 
 class RegisterRequest(BaseModel):
     username: str
+    email: str
     password: str
 
 
