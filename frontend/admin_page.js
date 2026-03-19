@@ -48,8 +48,6 @@ function AdminPage({
     ingestProgress,
     isIngesting,
     currentJobId,
-    isClearingDb,
-    clearDbStatus,
     feedbackData,
     feedbackLoading,
     feedbackTab,
@@ -66,7 +64,6 @@ function AdminPage({
     fetchCollections,
     fetchDocs,
     handleIngest,
-    handleClearDb,
     handleDeleteCollection,
     handleDeleteDoc,
     fetchFeedback,
@@ -468,22 +465,7 @@ function AdminPage({
               <h2 className="admin-card-title" style={{ flex: 1 }}>
                 Quản lý database
               </h2>
-              <button
-                className="btn btn-danger btn-sm"
-                onClick={handleClearDb}
-                disabled={isClearingDb}
-              >
-                {isClearingDb ? "Đang xóa..." : "Xóa toàn bộ DB"}
-              </button>
             </div>
-            {clearDbStatus && (
-              <p
-                className="admin-status"
-                style={{ marginTop: 0, marginBottom: "0.5rem" }}
-              >
-                {clearDbStatus}
-              </p>
-            )}
             {collectionsLoading && (
               <p className="admin-status">Đang tải...</p>
             )}

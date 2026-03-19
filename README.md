@@ -189,7 +189,6 @@ Then access:
 - `GET /admin/docs?collection_name=...`
 - `DELETE /admin/docs`
 - `DELETE /admin/collections/{collection_name}`
-- `POST /db/clear`
 - `GET /admin/users`
 - `PUT /admin/users/{user_id}/role`
 - `PUT /admin/users/{user_id}/password`
@@ -207,7 +206,5 @@ Then access:
 - Runtime files created automatically:
   - `uploads/`
   - `qdrant_db/`
-  - `feedback.json`
-  - `llm_usage.json`
 - Keep `qdrant_db/` and MongoDB data persisted in production.
 - `/ask` rate limit uses JWT `sub` when available; falls back to IP.

@@ -85,9 +85,6 @@ function App() {
   const pendingSessionIdRef = useRef(null);
   const cancelAnimRef = useRef(false);
 
-  const [isClearingDb, setIsClearingDb] = useState(false);
-  const [clearDbStatus, setClearDbStatus] = useState("");
-
   const [collections, setCollections] = useState([]);
   const [collectionsLoading, setCollectionsLoading] = useState(false);
   const [collectionsError, setCollectionsError] = useState("");
@@ -591,30 +588,6 @@ function App() {
     }
   }
 
-  async function handleClearDb() {
-    const confirmed = window.confirm(
-      "Bạn có chắc muốn xóa toàn bộ database? Toàn bộ collection và tài liệu sẽ bị xóa vĩnh viễn. Hành động này không thể hoàn tác."
-    );
-    if (!confirmed) return;
-    setIsClearingDb(true);
-    setClearDbStatus("");
-    try {
-      const resp = await authFetch(`${API_BASE}/db/clear`, { method: "POST" });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || `Request failed with ${resp.status}`);
-      }
-      const data = await resp.json();
-      setClearDbStatus(data.message || "Đã xóa database, hãy ingest lại tài liệu.");
-      await fetchCollections();
-    } catch (err) {
-      console.error(err);
-      setClearDbStatus(`Lỗi: ${err}`);
-    } finally {
-      setIsClearingDb(false);
-    }
-  }
-
   async function fetchCollections() {
     setCollectionsLoading(true);
     setCollectionsError("");
@@ -848,8 +821,6 @@ function App() {
               ingestProgress,
               isIngesting,
               currentJobId,
-              isClearingDb,
-              clearDbStatus,
               feedbackData,
               feedbackLoading,
               feedbackTab,
@@ -865,7 +836,6 @@ function App() {
               fetchCollections,
               fetchDocs,
               handleIngest,
-              handleClearDb,
               handleDeleteCollection,
               handleDeleteDoc,
               fetchFeedback,
@@ -891,8 +861,6 @@ function App() {
               ingestProgress,
               isIngesting,
               currentJobId,
-              isClearingDb,
-              clearDbStatus,
               feedbackData,
               feedbackLoading,
               feedbackTab,
@@ -908,7 +876,6 @@ function App() {
               fetchCollections,
               fetchDocs,
               handleIngest,
-              handleClearDb,
               handleDeleteCollection,
               handleDeleteDoc,
               fetchFeedback,

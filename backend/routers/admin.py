@@ -1,7 +1,6 @@
 """Admin router: collections, docs, users, analytics, feedback endpoints."""
 
 import json
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,19 +27,12 @@ from mongo_client import (
     get_users_collection,
     get_chat_sessions_collection,
     get_chat_messages_collection,
+    get_feedback_collection,
 )
-from utils import get_qdrant_client, reset_qdrant_client
+from utils import get_qdrant_client
 from llm_usage import get_usage
 
 router = APIRouter(tags=["admin"])
-
-# ---------------------------------------------------------------------------
-# Feedback helpers (file-backed store)
-# ---------------------------------------------------------------------------
-
-_FEEDBACK_FILE = Path(__file__).resolve().parent.parent.parent / "feedback.json"
-_feedback_lock = threading.Lock()
-
 
 def _is_root_admin_identity(username: str | None, email: str | None) -> bool:
     u = (username or "").strip().lower()
@@ -58,21 +50,6 @@ def _is_root_admin_doc(doc: dict[str, Any] | None) -> bool:
 
 def _is_root_admin_user(user: CurrentUser) -> bool:
     return _is_root_admin_identity(user.username, user.email)
-
-
-def _load_feedback() -> list[dict]:
-    if _FEEDBACK_FILE.exists():
-        try:
-            with open(_FEEDBACK_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return []
-    return []
-
-
-def _save_feedback(data: list[dict]):
-    with open(_FEEDBACK_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def _last_n_dates(n: int = 30) -> list[str]:
@@ -98,16 +75,14 @@ def submit_feedback(req: FeedbackRequest):
         raise HTTPException(status_code=400, detail="rating must be 'up' or 'down'")
     entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "date": time.strftime("%Y-%m-%d"),
         "question": req.question[:500],
         "answer": req.answer,
         "rating": req.rating,
         "comment": (req.comment or "")[:500],
         "session_id": req.session_id or "",
     }
-    with _feedback_lock:
-        data = _load_feedback()
-        data.append(entry)
-        _save_feedback(data)
+    get_feedback_collection().insert_one(entry)
 
     # Persist feedback onto the message document in MongoDB so it survives reload
     if req.session_id and req.answer:
@@ -132,11 +107,13 @@ def submit_feedback(req: FeedbackRequest):
 
 @router.get("/admin/feedback")
 def get_feedback(current_user: CurrentUser = Depends(get_current_admin)):
-    data = _load_feedback()
-    up = sum(1 for d in data if d.get("rating") == "up")
-    down = sum(1 for d in data if d.get("rating") == "down")
+    coll = get_feedback_collection()
+    total = coll.count_documents({})
+    up = coll.count_documents({"rating": "up"})
+    down = coll.count_documents({"rating": "down"})
+    data = list(coll.find({}, {"_id": 0}).sort("timestamp", -1).limit(200))
     return {
-        "total": len(data),
+        "total": total,
         "up": up,
         "down": down,
         "down_entries": list(reversed([d for d in data if d.get("rating") == "down"]))[:100],
@@ -149,7 +126,8 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
     total_users = get_users_collection().count_documents({})
     total_sessions = get_chat_sessions_collection().count_documents({})
     total_messages = get_chat_messages_collection().count_documents({})
-    fb_data = _load_feedback()
+    fb_coll = get_feedback_collection()
+    fb_data = list(fb_coll.find({}, {"_id": 0, "rating": 1, "timestamp": 1, "date": 1}))
 
     date_list = _last_n_dates(30)
 
@@ -193,8 +171,10 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
     # Feedback per day (from timestamp "YYYY-MM-DD HH:MM:SS")
     fb_by_date: dict[str, int] = {}
     for entry in fb_data:
-        ts = entry.get("timestamp", "")
-        day = ts[:10] if len(ts) >= 10 else ""
+        day = (entry.get("date") or "")[:10]
+        if not day:
+            ts = entry.get("timestamp", "")
+            day = ts[:10] if len(ts) >= 10 else ""
         if day:
             fb_by_date[day] = fb_by_date.get(day, 0) + 1
     feedback_per_day = [{"date": d, "count": fb_by_date.get(d, 0)} for d in date_list]
@@ -341,22 +321,6 @@ def delete_collection(
                 pass
 
     return {"message": f"Deleted collection '{collection_name}' and related metadata."}
-
-
-@router.post("/db/clear")
-def clear_db(current_user: CurrentUser = Depends(get_current_admin)):
-    """Clear the entire Qdrant database directory."""
-    import shutil
-    settings = get_settings()
-    db_path = Path(settings.persist_dir)
-    try:
-        reset_qdrant_client(settings.persist_dir)
-        if db_path.exists():
-            shutil.rmtree(db_path)
-        db_path.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"message": f"Cleared database at '{db_path}'. You can ingest again."}
 
 
 # ---------------------------------------------------------------------------

@@ -45,3 +45,11 @@ def get_chat_sessions_collection() -> Collection[Any]:
 
 def get_chat_messages_collection() -> Collection[Any]:
     return get_db()["chat_messages"]
+
+
+def get_feedback_collection() -> Collection[Any]:
+    return get_db()["feedback"]
+
+
+def get_llm_usage_collection() -> Collection[Any]:
+    return get_db()["llm_usage_daily"]
