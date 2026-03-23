@@ -70,10 +70,18 @@ class Settings(BaseSettings):
     google_redirect_uri: str = ""
     admin_emails: list[str] = []
 
+    # Evaluation (RAGAS)
+    eval_judge_model: str = "gpt-4o-mini"
+    eval_random_seed: int = 42
+    eval_max_workers: int = 2
+    eval_timeout_seconds: int = 90
+    eval_max_samples: int = 0
+
     # Paths (relative to project root)
     data_dir: Path = _BASE_DIR / "data"
     persist_dir: Path = _BASE_DIR / "qdrant_db"
     upload_dir: Path = _BASE_DIR / "uploads"
+    eval_output_dir: Path = _BASE_DIR / "eval_results"
 
     class Config:
         env_file = str(_BASE_DIR / ".env")

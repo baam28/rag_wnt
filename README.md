@@ -208,3 +208,70 @@ Then access:
   - `qdrant_db/`
 - Keep `qdrant_db/` and MongoDB data persisted in production.
 - `/ask` rate limit uses JWT `sub` when available; falls back to IP.
+
+## RAGAS Evaluation
+
+The repository includes a local evaluation runner at `backend/eval/ragas_runner.py`.
+It evaluates current retrieval + generation behavior directly from Python (no HTTP server required).
+
+### Dataset
+
+- Starter curated dataset: `backend/eval/datasets/curated.jsonl`
+- Required fields per JSONL row:
+  - `question` (string)
+  - `ground_truth` (string)
+  - `collections` (array, e.g. `['legal']`, `['drug']`, `['legal','drug']`)
+- Optional fields:
+  - `id`, `metadata`
+
+### Install eval dependencies
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Run evaluation (from project root)
+
+```bash
+source .venv/bin/activate
+cd backend
+python -m eval.ragas_runner \
+  --dataset eval/datasets/curated.jsonl \
+  --metrics faithfulness,answer_relevancy,context_precision,context_recall
+```
+
+### Include synthetic expansion
+
+```bash
+source .venv/bin/activate
+cd backend
+python -m eval.ragas_runner \
+  --dataset eval/datasets/curated.jsonl \
+  --include-synthetic \
+  --synthetic-max-per-collection 40
+```
+
+### Outputs
+
+Evaluation outputs are written to `eval_results/` (configurable via `EVAL_OUTPUT_DIR`):
+- `<run_name>.summary.json` (aggregate metrics + run metadata)
+- `<run_name>.raw.json` (per-row scored data from RAGAS)
+- `<run_name>.raw.csv` (CSV form of per-row scores)
+- `<run_name>.pipeline_outputs.json` (question, retrieved contexts, generated answer)
+
+### Environment options
+
+Optional settings in `.env`:
+
+```env
+EVAL_JUDGE_MODEL=gpt-4o-mini
+EVAL_MAX_WORKERS=2
+EVAL_TIMEOUT_SECONDS=90
+EVAL_MAX_SAMPLES=0
+EVAL_OUTPUT_DIR=eval_results
+```
+
+Notes:
+- Running evaluation may consume significant OpenAI tokens, depending on sample count.
+- If local Qdrant is locked by another process, stop the running backend before evaluation.

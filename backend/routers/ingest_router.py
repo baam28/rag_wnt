@@ -38,8 +38,82 @@ class IngestCancelled(Exception):
     """Raised when the user cancels an ingest job."""
 
 
-def _run_ingest_job(job_id: str, target_path: Path, collection_name: str, skip_summary: bool = False) -> None:
-    """Run ingest_file in a background thread and update job state for polling."""
+def _normalize_ingest_result(result: dict[str, Any], collection_name: str, fallback_file: str) -> dict[str, Any]:
+    return {
+        "file": result.get("file", fallback_file),
+        "collection_name": result.get("collection_name", collection_name),
+        "num_parents": result.get("num_parents", 0),
+        "num_children": result.get("num_children", 0),
+        "total_chunks_in_db": result.get("total_chunks_in_db", 0),
+    }
+
+
+def _save_uploaded_files(files: list[UploadFile], upload_dir: Path) -> list[Path]:
+    saved_paths: list[Path] = []
+    for file in files:
+        target_path = upload_dir / (file.filename or "document")
+        contents = file.file.read()
+        with open(target_path, "wb") as output_file:
+            output_file.write(contents)
+        saved_paths.append(target_path)
+    return saved_paths
+
+
+def _ingest_files_batch(
+    target_paths: list[Path],
+    collection_name: str,
+    skip_summary: bool,
+    progress_cb: Any | None = None,
+) -> dict[str, Any]:
+    files_out: list[dict[str, Any]] = []
+    total_parents = 0
+    total_children = 0
+    total_chunks_in_db = 0
+    total_files = len(target_paths)
+
+    for index, target_path in enumerate(target_paths, start=1):
+        if progress_cb:
+            progress_cb(
+                "file",
+                f"Đang ingest tệp {index}/{total_files}: {target_path.name}",
+                index - 1,
+                total_files,
+            )
+
+        result = ingest_file(
+            target_path,
+            collection_name=collection_name,
+            skip_summary=skip_summary,
+        )
+        if "error" in result:
+            return {"error": f"{target_path.name}: {result['error']}"}
+
+        normalized = _normalize_ingest_result(result, collection_name, target_path.name)
+        files_out.append(normalized)
+        total_parents += normalized["num_parents"]
+        total_children += normalized["num_children"]
+        total_chunks_in_db = normalized["total_chunks_in_db"]
+
+        if progress_cb:
+            progress_cb(
+                "file",
+                f"Đã xong {index}/{total_files}: {target_path.name}",
+                index,
+                total_files,
+            )
+
+    return {
+        "collection_name": collection_name,
+        "file_count": total_files,
+        "files": files_out,
+        "num_parents": total_parents,
+        "num_children": total_children,
+        "total_chunks_in_db": total_chunks_in_db,
+    }
+
+
+def _run_ingest_job(job_id: str, target_paths: list[Path], collection_name: str, skip_summary: bool = False) -> None:
+    """Run ingest_file for one or many files in a background thread and update job state for polling."""
     _set_job(job_id, {"status": "running", "phase": "start", "message": "Đang bắt đầu...", "current": 0, "total": 1})
 
     def progress_cb(step: str, msg: str, current: int, total: int) -> None:
@@ -49,7 +123,12 @@ def _run_ingest_job(job_id: str, target_path: Path, collection_name: str, skip_s
         _set_job(job_id, {"phase": step, "message": msg, "current": current, "total": total or 1})
 
     try:
-        result = ingest_file(target_path, collection_name=collection_name, on_progress=progress_cb, skip_summary=skip_summary)
+        result = _ingest_files_batch(
+            target_paths=target_paths,
+            collection_name=collection_name,
+            skip_summary=skip_summary,
+            progress_cb=progress_cb,
+        )
         if "error" in result:
             _set_job(job_id, {"status": "error", "error": result["error"]})
             return
@@ -59,13 +138,7 @@ def _run_ingest_job(job_id: str, target_path: Path, collection_name: str, skip_s
                 "status": "done",
                 "phase": "done",
                 "message": "Hoàn thành",
-                "result": IngestResponse(
-                    file=result.get("file", str(target_path)),
-                    collection_name=result.get("collection_name", collection_name),
-                    num_parents=result.get("num_parents", 0),
-                    num_children=result.get("num_children", 0),
-                    total_chunks_in_db=result.get("total_chunks_in_db", 0),
-                ),
+                "result": result,
             },
         )
     except IngestCancelled:
@@ -78,36 +151,43 @@ def _run_ingest_job(job_id: str, target_path: Path, collection_name: str, skip_s
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@router.post("/ingest-file", response_model=IngestResponse)
+@router.post("/ingest-file")
 async def ingest_file_endpoint(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(..., alias="file"),
     collection_name: str = Form("rag_chatbot"),
     skip_summary: str = Form("false"),
     async_mode: bool = Query(False, alias="async"),
 ):
-    """Ingest a single uploaded file into the vector store.
+    """Ingest one or many uploaded files into the vector store.
     Use ?async=true for background processing and poll GET /ingest-jobs/{job_id}.
     """
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+
     settings = get_settings()
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    target_path = upload_dir / (file.filename or "document")
 
     try:
-        contents = await file.read()
-        with open(target_path, "wb") as f:
-            f.write(contents)
+        target_paths = _save_uploaded_files(files, upload_dir)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
     skip = skip_summary.strip().lower() in ("true", "1", "yes")
+    total_files = len(target_paths)
 
     if async_mode:
         job_id = str(uuid.uuid4())
-        _set_job(job_id, {"status": "pending", "phase": "pending", "message": "Đang xếp hàng...", "current": 0, "total": 1})
+        _set_job(job_id, {
+            "status": "pending",
+            "phase": "pending",
+            "message": f"Đang xếp hàng {total_files} tệp...",
+            "current": 0,
+            "total": total_files,
+        })
         threading.Thread(
             target=_run_ingest_job,
-            args=(job_id, target_path, collection_name),
+            args=(job_id, target_paths, collection_name),
             kwargs={"skip_summary": skip},
             daemon=True,
         ).start()
@@ -117,7 +197,11 @@ async def ingest_file_endpoint(
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: ingest_file(target_path, collection_name=collection_name, skip_summary=skip),
+            lambda: _ingest_files_batch(
+                target_paths=target_paths,
+                collection_name=collection_name,
+                skip_summary=skip,
+            ),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -125,13 +209,16 @@ async def ingest_file_endpoint(
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
 
-    return IngestResponse(
-        file=result.get("file", str(target_path)),
-        collection_name=result.get("collection_name", collection_name),
-        num_parents=result.get("num_parents", 0),
-        num_children=result.get("num_children", 0),
-        total_chunks_in_db=result.get("total_chunks_in_db", 0),
-    )
+    if total_files == 1:
+        single = result.get("files", [{}])[0]
+        return IngestResponse(
+            file=single.get("file", target_paths[0].name),
+            collection_name=single.get("collection_name", collection_name),
+            num_parents=single.get("num_parents", 0),
+            num_children=single.get("num_children", 0),
+            total_chunks_in_db=single.get("total_chunks_in_db", 0),
+        )
+    return result
 
 
 @router.get("/ingest-jobs/{job_id}", response_model=IngestJobStatusResponse)

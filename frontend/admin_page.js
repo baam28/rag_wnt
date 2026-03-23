@@ -39,7 +39,7 @@ function AdminPage({
     docs,
     docsLoading,
     docsError,
-    uploadFile,
+    uploadFiles,
     collectionName,
     newCollectionMode,
     newCollectionName,
@@ -54,7 +54,7 @@ function AdminPage({
   } = state;
 
   const {
-    setUploadFile,
+    setUploadFiles,
     setCollectionName,
     setNewCollectionMode,
     setNewCollectionName,
@@ -365,9 +365,15 @@ function AdminPage({
                 <input
                   type="file"
                   accept=".pdf,.doc,.docx"
+                  multiple
                   className="admin-input"
-                  onChange={(e) => setUploadFile(e.target.files[0] || null)}
+                  onChange={(e) => setUploadFiles(Array.from(e.target.files || []))}
                 />
+                {Array.isArray(uploadFiles) && uploadFiles.length > 0 && (
+                  <p className="admin-card-caption" style={{ marginTop: "0.5rem" }}>
+                    Đã chọn {uploadFiles.length} tệp: {uploadFiles.map((f) => f.name).join(", ")}
+                  </p>
+                )}
               </div>
               <div className="admin-field">
                 <label className="admin-label">Collection</label>

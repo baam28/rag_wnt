@@ -162,7 +162,7 @@ class IngestJobStatusResponse(BaseModel):
     current: Optional[int] = None
     total: Optional[int] = None
     message: Optional[str] = None
-    result: Optional[IngestResponse] = None
+    result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
 
 

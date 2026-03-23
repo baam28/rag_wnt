@@ -374,6 +374,24 @@ def _extract_usage(resp: Any) -> Dict[str, int]:
     return out
 
 
+def _build_chat_openai_client(
+    model_name: str,
+    api_key: str,
+    temperature: float,
+    max_output_tokens: int,
+) -> ChatOpenAI:
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "api_key": api_key,
+    }
+    if (model_name or "").lower().startswith("gpt-5"):
+        kwargs["max_completion_tokens"] = max_output_tokens
+    else:
+        kwargs["temperature"] = temperature
+        kwargs["max_tokens"] = max_output_tokens
+    return ChatOpenAI(**kwargs)
+
+
 def _generate_with_openai(
     query: str,
     context_list: List[Dict[str, Any]],
@@ -479,11 +497,11 @@ def _generate_with_openai(
         # Drop oldest non-system history message first.
         del messages[1]
 
-    llm = ChatOpenAI(
-        model=model_name,
+    llm = _build_chat_openai_client(
+        model_name=model_name,
         api_key=settings.openai_api_key,
         temperature=0.2,
-        max_tokens=max_output_tokens,
+        max_output_tokens=max_output_tokens,
     )
 
     fallback_model_name = (getattr(settings, "llm_fallback_model", "") or "").strip()
@@ -528,11 +546,11 @@ def _generate_with_openai(
                 return _friendly_llm_error(rescue_err), empty_usage
         if not content and use_fallback:
             try:
-                fallback_llm = ChatOpenAI(
-                    model=fallback_model_name,
+                fallback_llm = _build_chat_openai_client(
+                    model_name=fallback_model_name,
                     api_key=settings.openai_api_key,
                     temperature=0.2,
-                    max_tokens=max_output_tokens,
+                    max_output_tokens=max_output_tokens,
                 )
                 fallback_resp = fallback_llm.invoke(messages)
                 content = _extract_text_content(fallback_resp)

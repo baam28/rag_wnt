@@ -498,11 +498,13 @@ def get_llm() -> ChatOpenAI:
         with _llm_lock:
             if _llm is None:
                 settings = get_settings()
-                _llm = ChatOpenAI(
-                    model=settings.llm_model,
-                    api_key=settings.openai_api_key,
-                    temperature=0.1,
-                )
+                kwargs: dict[str, Any] = {
+                    "model": settings.llm_model,
+                    "api_key": settings.openai_api_key,
+                }
+                if not (settings.llm_model or "").lower().startswith("gpt-5"):
+                    kwargs["temperature"] = 0.1
+                _llm = ChatOpenAI(**kwargs)
     return _llm
 
 

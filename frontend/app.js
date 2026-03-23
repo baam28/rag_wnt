@@ -66,7 +66,7 @@ function App() {
   const [askError, setAskError] = useState("");
 
   // Admin state
-  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadFiles, setUploadFiles] = useState([]);
   const [collectionName, setCollectionName] = useState("");
   const [newCollectionMode, setNewCollectionMode] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
@@ -204,14 +204,17 @@ function App() {
 
         if (j.status === "done") {
           stopIngestPolling();
-          const res = j.result;
+          const res = j.result || {};
+          const fileCount = Number(res.file_count || (Array.isArray(res.files) ? res.files.length : 0) || 1);
           setIngestStatus(
-            `Đã ingest: ${res.num_parents} parent, ${res.num_children} child → collection ${res.collection_name}`
+            fileCount > 1
+              ? `Đã ingest ${fileCount} tệp: ${res.num_parents || 0} parent, ${res.num_children || 0} child → collection ${res.collection_name || collectionName || "drug"}`
+              : `Đã ingest: ${res.num_parents || 0} parent, ${res.num_children || 0} child → collection ${res.collection_name || collectionName || "drug"}`
           );
           await fetchCollections();
           setNewCollectionMode(false);
           setNewCollectionName("");
-          setCollectionName(res.collection_name);
+          setCollectionName(res.collection_name || collectionName || "drug");
         } else if (j.status === "error" || j.status === "cancelled") {
           const statusMsg = j.status === "cancelled" ? "Đã hủy." : `Lỗi ingest: ${j.error || "Unknown"}`;
           stopIngestPolling();
@@ -538,7 +541,7 @@ function App() {
 
   async function handleIngest(e) {
     e.preventDefault();
-    if (!uploadFile) {
+    if (!uploadFiles || uploadFiles.length === 0) {
       setIngestStatus("Chọn ít nhất một tệp để ingest.");
       return;
     }
@@ -549,10 +552,10 @@ function App() {
     }
     setIsIngesting(true);
     setIngestStatus("Đang tải lên...");
-    setIngestProgress({ phase: "upload", message: "Đang tải lên file...", current: 0, total: 1 });
+    setIngestProgress({ phase: "upload", message: "Đang tải lên file...", current: 0, total: uploadFiles.length });
     try {
       const form = new FormData();
-      form.append("file", uploadFile);
+      uploadFiles.forEach((file) => form.append("file", file));
       form.append("collection_name", targetCollection);
       form.append("skip_summary", skipSummary ? "true" : "false");
       const resp = await authFetch(`${API_BASE}/ingest-file?async=true`, {
@@ -569,8 +572,11 @@ function App() {
         if (data.error) {
           setIngestStatus(`Lỗi: ${data.error}`);
         } else {
+          const fileCount = Number(data.file_count || (Array.isArray(data.files) ? data.files.length : 0) || 1);
           setIngestStatus(
-            `Đã ingest: ${data.num_parents} parent, ${data.num_children} child → collection ${data.collection_name}`
+            fileCount > 1
+              ? `Đã ingest ${fileCount} tệp: ${data.num_parents || 0} parent, ${data.num_children || 0} child → collection ${data.collection_name || targetCollection}`
+              : `Đã ingest: ${data.num_parents || 0} parent, ${data.num_children || 0} child → collection ${data.collection_name || targetCollection}`
           );
           await fetchCollections();
           setNewCollectionMode(false);
@@ -812,7 +818,7 @@ function App() {
               docs,
               docsLoading,
               docsError,
-              uploadFile,
+              uploadFiles,
               collectionName,
               newCollectionMode,
               newCollectionName,
@@ -826,7 +832,7 @@ function App() {
               feedbackTab,
             }}
             handlers={{
-              setUploadFile,
+              setUploadFiles,
               setCollectionName,
               setNewCollectionMode,
               setNewCollectionName,
@@ -852,7 +858,7 @@ function App() {
               docs,
               docsLoading,
               docsError,
-              uploadFile,
+              uploadFiles,
               collectionName,
               newCollectionMode,
               newCollectionName,
@@ -866,7 +872,7 @@ function App() {
               feedbackTab,
             }}
             handlers={{
-              setUploadFile,
+              setUploadFiles,
               setCollectionName,
               setNewCollectionMode,
               setNewCollectionName,
