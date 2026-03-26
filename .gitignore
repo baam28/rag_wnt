@@ -32,6 +32,7 @@ frontend/dist/
 # Project runtime data
 uploads/
 data/
+eval_results/
 feedback.json
 llm_usage.json
 
