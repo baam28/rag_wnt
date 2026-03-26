@@ -22,6 +22,21 @@ const COLLECTION_LABELS = {
   legal: "Văn bản pháp lý",
 };
 
+const DOCS_DEFAULT_QUERY = {
+  search: "",
+  sort_by: "document_date",
+  sort_order: "desc",
+  year_from: "",
+  year_to: "",
+};
+
+const DOC_SORT_OPTIONS = [
+  { value: "document_date:desc", label: "Năm ban hành (mới → cũ)" },
+  { value: "document_date:asc", label: "Năm ban hành (cũ → mới)" },
+  { value: "source:asc", label: "Tên A → Z" },
+  { value: "source:desc", label: "Tên Z → A" },
+];
+
 function getCollectionLabel(name) {
   return COLLECTION_LABELS[name] || name;
 }
@@ -39,6 +54,7 @@ function AdminPage({
     docs,
     docsLoading,
     docsError,
+    docsQuery,
     uploadFiles,
     collectionName,
     newCollectionMode,
@@ -60,12 +76,14 @@ function AdminPage({
     setNewCollectionName,
     setSkipSummary,
     setSelectedCollection,
+    setDocsQuery,
     setFeedbackTab,
     fetchCollections,
     fetchDocs,
     handleIngest,
     handleDeleteCollection,
     handleDeleteDoc,
+    handleDeleteDocs,
     fetchFeedback,
     authFetch,
   } = handlers;
@@ -77,7 +95,52 @@ function AdminPage({
   const [users, setUsers] = React.useState([]);
   const [usersLoading, setUsersLoading] = React.useState(false);
 
+  const [docFilters, setDocFilters] = React.useState(docsQuery || { ...DOCS_DEFAULT_QUERY });
+  const [selectedDocs, setSelectedDocs] = React.useState([]);
+
   const [pwdForm, setPwdForm] = React.useState({ userId: null, value: "" });
+
+  React.useEffect(() => {
+    setDocFilters(docsQuery || { ...DOCS_DEFAULT_QUERY });
+  }, [docsQuery]);
+
+  function applyDocFilters(nextFilters = docFilters) {
+    const normalized = {
+      search: String(nextFilters.search || "").trim(),
+      sort_by: nextFilters.sort_by || "document_date",
+      sort_order: nextFilters.sort_order || "desc",
+      year_from: nextFilters.year_from === "" ? "" : String(nextFilters.year_from).trim(),
+      year_to: nextFilters.year_to === "" ? "" : String(nextFilters.year_to).trim(),
+    };
+    setDocsQuery(normalized);
+    if (selectedCollection) {
+      fetchDocs(selectedCollection, normalized);
+    }
+  }
+
+  const hasActiveDocFilters = Boolean(
+    (docFilters.search || "").trim() ||
+    (docFilters.year_from || "").toString().trim() ||
+    (docFilters.year_to || "").toString().trim() ||
+    `${docFilters.sort_by || "document_date"}:${docFilters.sort_order || "desc"}` !== "document_date:desc"
+  );
+
+  function resetDocFilters() {
+    const resetValue = { ...DOCS_DEFAULT_QUERY };
+    setDocFilters(resetValue);
+    setDocsQuery(resetValue);
+    if (selectedCollection) {
+      fetchDocs(selectedCollection, resetValue);
+    }
+  }
+
+  React.useEffect(() => {
+    setSelectedDocs((prev) => prev.filter((source) => docs.some((d) => d.source === source)));
+  }, [docs]);
+
+  React.useEffect(() => {
+    setSelectedDocs([]);
+  }, [selectedCollection]);
 
   React.useEffect(() => {
     if (activeTab === "analytics" && !analyticsData) {
@@ -502,17 +565,131 @@ function AdminPage({
                   </div>
                   {selectedCollection === c.name && (
                     <div className="admin-collection-body">
-                      <div
-                        className="admin-actions"
-                        style={{ justifyContent: "flex-end", marginBottom: "0.75rem" }}
+                      <form
+                        className="admin-doc-toolbar"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          applyDocFilters();
+                        }}
                       >
-                        <button
-                          className="btn btn-danger btn-sm"
-                          onClick={() => handleDeleteCollection(c.name)}
-                          title={`Xóa toàn bộ dữ liệu trong collection '${c.name}'`}
-                        >
-                          Làm trống collection
-                        </button>
+                        <div className="admin-doc-toolbar-head">
+                          <div>
+                            <p className="admin-doc-toolbar-title">Tìm kiếm & sắp xếp</p>
+                            <p className="admin-doc-toolbar-caption">
+                              {docsLoading
+                                ? "Đang cập nhật danh sách..."
+                                : `${docs.length} tài liệu${hasActiveDocFilters ? " · đang áp dụng bộ lọc" : ""}`}
+                            </p>
+                          </div>
+                          <div className="admin-doc-toolbar-actions">
+                            <button className="btn btn-primary btn-sm" type="submit">Áp dụng</button>
+                            <button className="btn btn-ghost btn-sm" type="button" onClick={resetDocFilters}>Đặt lại</button>
+                          </div>
+                        </div>
+
+                        <div className="admin-doc-filters-row">
+                          <div className="admin-doc-field">
+                            <label className="admin-label" htmlFor={`doc-search-${c.name}`}>Tìm tài liệu</label>
+                            <input
+                              id={`doc-search-${c.name}`}
+                              type="text"
+                              className="admin-input admin-doc-search"
+                              placeholder="Nhập tên văn bản..."
+                              value={docFilters.search || ""}
+                              onChange={(e) => setDocFilters((prev) => ({ ...prev, search: e.target.value }))}
+                            />
+                          </div>
+                          <div className="admin-doc-field">
+                            <label className="admin-label" htmlFor={`doc-sort-${c.name}`}>Sắp xếp</label>
+                            <select
+                              id={`doc-sort-${c.name}`}
+                              className="admin-input"
+                              value={`${docFilters.sort_by || "document_date"}:${docFilters.sort_order || "desc"}`}
+                              onChange={(e) => {
+                                const [sortBy, sortOrder] = String(e.target.value).split(":");
+                                setDocFilters((prev) => ({
+                                  ...prev,
+                                  sort_by: sortBy || "document_date",
+                                  sort_order: sortOrder || "desc",
+                                }));
+                              }}
+                            >
+                              {DOC_SORT_OPTIONS.map((opt) => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+
+                        <div className="admin-doc-filters-row admin-doc-filters-row--years">
+                          <div className="admin-doc-field">
+                            <label className="admin-label" htmlFor={`doc-year-from-${c.name}`}>Từ năm</label>
+                            <input
+                              id={`doc-year-from-${c.name}`}
+                              type="number"
+                              min="1900"
+                              max="2099"
+                              step="1"
+                              className="admin-input"
+                              placeholder="Ví dụ: 2016"
+                              value={docFilters.year_from || ""}
+                              onChange={(e) => setDocFilters((prev) => ({ ...prev, year_from: e.target.value }))}
+                            />
+                          </div>
+                          <div className="admin-doc-field">
+                            <label className="admin-label" htmlFor={`doc-year-to-${c.name}`}>Đến năm</label>
+                            <input
+                              id={`doc-year-to-${c.name}`}
+                              type="number"
+                              min="1900"
+                              max="2099"
+                              step="1"
+                              className="admin-input"
+                              placeholder="Ví dụ: 2026"
+                              value={docFilters.year_to || ""}
+                              onChange={(e) => setDocFilters((prev) => ({ ...prev, year_to: e.target.value }))}
+                            />
+                          </div>
+                        </div>
+                      </form>
+                      <div className="admin-doc-bulk-bar">
+                        <label className="admin-doc-check-all">
+                          <input
+                            type="checkbox"
+                            checked={docs.length > 0 && selectedDocs.length === docs.length}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedDocs(docs.map((d) => d.source));
+                              } else {
+                                setSelectedDocs([]);
+                              }
+                            }}
+                          />
+                          <span>Chọn tất cả</span>
+                        </label>
+                        <div className="admin-doc-bulk-actions">
+                          <span className="admin-doc-selected-count">
+                            {selectedDocs.length > 0 ? `Đã chọn ${selectedDocs.length}` : "Chưa chọn tài liệu"}
+                          </span>
+                          <button
+                            className="btn btn-danger btn-sm"
+                            type="button"
+                            disabled={selectedDocs.length === 0 || docsLoading}
+                            onClick={async () => {
+                              await handleDeleteDocs(selectedCollection, selectedDocs);
+                              setSelectedDocs([]);
+                            }}
+                          >
+                            Xóa đã chọn
+                          </button>
+                          <button
+                            className="btn btn-danger btn-sm"
+                            onClick={() => handleDeleteCollection(c.name)}
+                            title={`Xóa toàn bộ dữ liệu trong collection '${c.name}'`}
+                          >
+                            Xoá tất cả văn bản
+                          </button>
+                        </div>
                       </div>
                       {docsLoading && (
                         <p className="admin-status">Đang tải...</p>
@@ -521,7 +698,7 @@ function AdminPage({
                         <p className="admin-error">{docsError}</p>
                       )}
                       {!docsLoading && docs.length === 0 && (
-                        <p className="admin-status">Trống.</p>
+                        <p className="admin-status">Không có tài liệu phù hợp bộ lọc hiện tại.</p>
                       )}
                       {docs.length > 0 && (
                         <ul className="admin-doc-list">
@@ -530,13 +707,26 @@ function AdminPage({
                               key={d.source}
                               className="admin-doc-item"
                             >
+                              <label className="admin-doc-check">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedDocs.includes(d.source)}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setSelectedDocs((prev) => (prev.includes(d.source) ? prev : [...prev, d.source]));
+                                    } else {
+                                      setSelectedDocs((prev) => prev.filter((source) => source !== d.source));
+                                    }
+                                  }}
+                                />
+                              </label>
                               <div className="admin-doc-info">
                                 <span className="admin-doc-source">
                                   {d.source}
                                 </span>
-                                <span className="admin-doc-chunks">
-                                  ({d.parent_count} tài liệu gốc)
-                                </span>
+                                {d.document_year ? (
+                                  <span className="admin-doc-year">Năm: {d.document_year}</span>
+                                ) : null}
                               </div>
                               <button
                                 className="btn btn-ghost btn-sm"

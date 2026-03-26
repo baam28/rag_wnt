@@ -97,6 +97,8 @@ class CollectionInfo(BaseModel):
 class DocumentInfo(BaseModel):
     source: str
     parent_count: int
+    document_year: Optional[int] = None
+    document_year_source: Optional[str] = None
 
 
 class RegisterRequest(BaseModel):

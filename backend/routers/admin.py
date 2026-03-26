@@ -22,7 +22,7 @@ from deps import (
     get_current_admin,
 )
 from mongo_client import (
-    count_vector_parents_by_source,
+    list_vector_parents_by_source,
     delete_collection_vector_meta,
     delete_vector_parents_by_source,
     get_users_collection,
@@ -228,13 +228,42 @@ def list_collections(current_user: CurrentUser = Depends(get_current_admin)):
 @router.get("/admin/docs", response_model=list[DocumentInfo])
 def list_documents(
     collection_name: str = Query(..., alias="collection_name"),
+    search: str = Query(""),
+    sort_by: str = Query("document_date"),
+    sort_order: str = Query("desc"),
+    year_from: int | None = Query(None, ge=1900, le=2099),
+    year_to: int | None = Query(None, ge=1900, le=2099),
     current_user: CurrentUser = Depends(get_current_admin),
 ):
+    allowed_sort_by = {"document_date", "source"}
+    allowed_sort_order = {"asc", "desc"}
+    if sort_by not in allowed_sort_by:
+        raise HTTPException(status_code=400, detail=f"sort_by must be one of: {', '.join(sorted(allowed_sort_by))}")
+    if sort_order not in allowed_sort_order:
+        raise HTTPException(status_code=400, detail=f"sort_order must be one of: {', '.join(sorted(allowed_sort_order))}")
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise HTTPException(status_code=400, detail="year_from must be <= year_to")
+
     try:
-        counts = count_vector_parents_by_source(collection_name)
+        rows = list_vector_parents_by_source(
+            collection_name=collection_name,
+            search=search,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            year_from=year_from,
+            year_to=year_to,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return [DocumentInfo(source=s, parent_count=n) for s, n in counts.items()]
+    return [
+        DocumentInfo(
+            source=str(row.get("source") or "Unknown"),
+            parent_count=int(row.get("parent_count") or 0),
+            document_year=row.get("document_year"),
+            document_year_source=row.get("document_year_source"),
+        )
+        for row in rows
+    ]
 
 
 @router.delete("/admin/docs")

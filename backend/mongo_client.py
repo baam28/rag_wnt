@@ -6,6 +6,7 @@ instances.  The double-checked locking pattern prevents this without adding
 lock overhead on every call after initialisation.
 """
 
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -104,6 +105,7 @@ def upsert_vector_parents(collection_name: str, parent_meta: dict[str, dict[str,
     coll = get_vector_parents_collection()
     now = datetime.now(timezone.utc)
     for parent_id, meta in parent_meta.items():
+        document_year = _extract_year_from_issuance_date(meta.get("issuance_date"))
         coll.update_one(
             {"collection_name": collection_name, "parent_id": parent_id},
             {
@@ -112,6 +114,7 @@ def upsert_vector_parents(collection_name: str, parent_meta: dict[str, dict[str,
                     "summary": meta.get("summary", ""),
                     "target_question": meta.get("target_question", ""),
                     "source": meta.get("source", "Unknown"),
+                    "document_year": document_year,
                     "updated_at": now,
                 }
             },
@@ -119,17 +122,112 @@ def upsert_vector_parents(collection_name: str, parent_meta: dict[str, dict[str,
         )
 
 
-def count_vector_parents_by_source(collection_name: str) -> dict[str, int]:
+def _extract_year_from_source(source: str) -> int | None:
+    text = str(source or "")
+    if not text:
+        return None
+    years = []
+    for match in re.finditer(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", text):
+        try:
+            years.append(int(match.group(1)))
+        except Exception:
+            continue
+    if not years:
+        return None
+    return max(years)
+
+
+def _extract_year_from_issuance_date(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = text.split("/")
+    if len(parts) >= 3:
+        try:
+            year_val = int(parts[-1])
+            if 1900 <= year_val <= 2099:
+                return year_val
+        except Exception:
+            pass
+    return _extract_year_from_source(text)
+
+
+def list_vector_parents_by_source(
+    collection_name: str,
+    search: str = "",
+    sort_by: str = "document_date",
+    sort_order: str = "desc",
+    year_from: int | None = None,
+    year_to: int | None = None,
+) -> list[dict[str, Any]]:
     coll = get_vector_parents_collection()
-    pipeline = [
+    pipeline: list[dict[str, Any]] = [
         {"$match": {"collection_name": collection_name}},
-        {"$group": {"_id": "$source", "count": {"$sum": 1}}},
+        {
+            "$group": {
+                "_id": "$source",
+                "count": {"$sum": 1},
+                "document_year": {"$max": "$document_year"},
+            }
+        },
     ]
-    out: dict[str, int] = {}
+
+    search_value = str(search or "").strip()
+    if search_value:
+        escaped = re.escape(search_value)
+        pipeline.append({"$match": {"_id": {"$regex": escaped, "$options": "i"}}})
+
+    rows: list[dict[str, Any]] = []
     for row in coll.aggregate(pipeline):
         source = str(row.get("_id") or "Unknown")
-        out[source] = int(row.get("count", 0))
-    return out
+        count = int(row.get("count", 0))
+        mongo_year = row.get("document_year")
+        document_year: int | None = None
+        document_year_source = "none"
+        try:
+            if mongo_year is not None:
+                document_year = int(mongo_year)
+                document_year_source = "issuance_date"
+        except Exception:
+            document_year = None
+        if document_year is None:
+            extracted = _extract_year_from_source(source)
+            if extracted is not None:
+                document_year = extracted
+                document_year_source = "source_regex"
+
+        rows.append(
+            {
+                "source": source,
+                "parent_count": count,
+                "document_year": document_year,
+                "document_year_source": document_year_source,
+            }
+        )
+
+    if year_from is not None:
+        rows = [r for r in rows if r.get("document_year") is not None and int(r["document_year"]) >= year_from]
+    if year_to is not None:
+        rows = [r for r in rows if r.get("document_year") is not None and int(r["document_year"]) <= year_to]
+
+    reverse = str(sort_order or "desc").lower() == "desc"
+    key_name = str(sort_by or "document_date").lower()
+    if key_name == "source":
+        rows.sort(key=lambda item: (str(item.get("source") or "").lower(), str(item.get("source") or "")), reverse=reverse)
+    elif key_name == "parent_count":
+        rows.sort(key=lambda item: (int(item.get("parent_count") or 0), str(item.get("source") or "").lower()), reverse=reverse)
+    else:
+        rows.sort(
+            key=lambda item: (
+                item.get("document_year") is None,
+                -(int(item.get("document_year") or 0)) if reverse else int(item.get("document_year") or 0),
+                str(item.get("source") or "").lower(),
+            )
+        )
+
+    return rows
 
 
 def delete_vector_parents_by_source(collection_name: str, source: str) -> None:

@@ -92,6 +92,13 @@ function App() {
   const [docs, setDocs] = useState([]);
   const [docsLoading, setDocsLoading] = useState(false);
   const [docsError, setDocsError] = useState("");
+  const [docsQuery, setDocsQuery] = useState({
+    search: "",
+    sort_by: "document_date",
+    sort_order: "desc",
+    year_from: "",
+    year_to: "",
+  });
 
   const [feedbackData, setFeedbackData] = useState(null);
   const [feedbackLoading, setFeedbackLoading] = useState(false);
@@ -621,19 +628,38 @@ function App() {
     }
   }
 
-  async function fetchDocs(collectionName) {
+  async function fetchDocs(collectionName, overrides = {}) {
     if (!collectionName) {
       setDocs([]);
       return;
     }
+    const effectiveQuery = {
+      ...docsQuery,
+      ...(overrides || {}),
+    };
+    if (overrides && Object.keys(overrides).length > 0) {
+      setDocsQuery(effectiveQuery);
+    }
+
+    const params = new URLSearchParams({
+      collection_name: collectionName,
+      sort_by: effectiveQuery.sort_by || "document_date",
+      sort_order: effectiveQuery.sort_order || "desc",
+    });
+    if (effectiveQuery.search) {
+      params.set("search", String(effectiveQuery.search));
+    }
+    if (effectiveQuery.year_from !== "" && effectiveQuery.year_from != null) {
+      params.set("year_from", String(effectiveQuery.year_from));
+    }
+    if (effectiveQuery.year_to !== "" && effectiveQuery.year_to != null) {
+      params.set("year_to", String(effectiveQuery.year_to));
+    }
+
     setDocsLoading(true);
     setDocsError("");
     try {
-      const resp = await authFetch(
-        `${API_BASE}/admin/docs?collection_name=${encodeURIComponent(
-          collectionName
-        )}`
-      );
+      const resp = await authFetch(`${API_BASE}/admin/docs?${params.toString()}`);
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `Request failed with ${resp.status}`);
@@ -670,6 +696,46 @@ function App() {
     } catch (err) {
       console.error(err);
       setDocsError(String(err));
+    }
+  }
+
+  async function handleDeleteDocs(collectionName, sources = []) {
+    const uniqueSources = Array.from(new Set((sources || []).filter(Boolean)));
+    if (!collectionName || uniqueSources.length === 0) {
+      return;
+    }
+    if (
+      !window.confirm(
+        `Xóa ${uniqueSources.length} tài liệu đã chọn khỏi collection '${collectionName}'?`
+      )
+    ) {
+      return;
+    }
+
+    setDocsLoading(true);
+    setDocsError("");
+    try {
+      const failures = [];
+      for (const source of uniqueSources) {
+        const resp = await authFetch(`${API_BASE}/admin/docs`, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ collection_name: collectionName, source }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          failures.push(err.detail || source);
+        }
+      }
+      if (failures.length > 0) {
+        throw new Error(`Không thể xóa một số tài liệu: ${failures.slice(0, 3).join(", ")}`);
+      }
+      await fetchDocs(collectionName);
+    } catch (err) {
+      console.error(err);
+      setDocsError(String(err));
+    } finally {
+      setDocsLoading(false);
     }
   }
 
@@ -817,6 +883,7 @@ function App() {
               docs,
               docsLoading,
               docsError,
+              docsQuery,
               uploadFiles,
               collectionName,
               newCollectionMode,
@@ -837,12 +904,14 @@ function App() {
               setNewCollectionName,
               setSkipSummary,
               setSelectedCollection,
+              setDocsQuery,
               setFeedbackTab,
               fetchCollections,
               fetchDocs,
               handleIngest,
               handleDeleteCollection,
               handleDeleteDoc,
+              handleDeleteDocs,
               fetchFeedback,
               authFetch,
             }}
@@ -857,6 +926,7 @@ function App() {
               docs,
               docsLoading,
               docsError,
+              docsQuery,
               uploadFiles,
               collectionName,
               newCollectionMode,
@@ -877,12 +947,14 @@ function App() {
               setNewCollectionName,
               setSkipSummary,
               setSelectedCollection,
+              setDocsQuery,
               setFeedbackTab,
               fetchCollections,
               fetchDocs,
               handleIngest,
               handleDeleteCollection,
               handleDeleteDoc,
+              handleDeleteDocs,
               fetchFeedback,
               authFetch,
             }}

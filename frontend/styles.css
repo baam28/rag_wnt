@@ -1588,6 +1588,80 @@ select.admin-input { cursor: pointer; appearance: auto; }
 .admin-collection-arrow { font-size: .65rem; color: var(--c-text-4); width: 1rem; text-align: center; flex-shrink: 0; }
 .admin-collection-name { flex: 1; min-width: 0; font-size: .8125rem; font-weight: 600; color: var(--c-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .admin-collection-body { padding: .5rem .75rem; background: var(--c-surface); }
+.admin-doc-toolbar {
+  margin-bottom: .85rem;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  background: var(--c-surface-2);
+  padding: .7rem;
+  display: flex;
+  flex-direction: column;
+  gap: .6rem;
+}
+.admin-doc-toolbar-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .75rem;
+}
+.admin-doc-toolbar-title {
+  margin: 0;
+  font-size: .8rem;
+  font-weight: 700;
+  color: var(--c-text);
+}
+.admin-doc-toolbar-caption {
+  margin: .2rem 0 0;
+  font-size: .74rem;
+  color: var(--c-text-3);
+}
+.admin-doc-toolbar-actions { display: flex; gap: .4rem; }
+.admin-doc-filters-row { display: grid; grid-template-columns: 2fr 1fr; gap: .55rem; }
+.admin-doc-filters-row--years { grid-template-columns: 1fr 1fr; }
+.admin-doc-field { min-width: 0; }
+.admin-doc-field .admin-label { margin-bottom: .25rem; font-size: .74rem; }
+.admin-doc-search { min-height: 2.1rem; }
+.admin-doc-bulk-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  margin-bottom: .75rem;
+  padding: .5rem .6rem;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  background: var(--c-surface-2);
+}
+.admin-doc-check-all,
+.admin-doc-check {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  color: var(--c-text-2);
+}
+.admin-doc-check-all input,
+.admin-doc-check input {
+  width: .95rem;
+  height: .95rem;
+  accent-color: var(--c-brand);
+}
+.admin-doc-check-all span {
+  font-size: .78rem;
+  font-weight: 500;
+}
+.admin-doc-bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.admin-doc-selected-count {
+  font-size: .74rem;
+  color: var(--c-text-3);
+  min-width: 7.5rem;
+  text-align: right;
+}
 .admin-collection-body .admin-doc-list { margin: 0; }
 .admin-collection-body .admin-doc-item { padding: .375rem .5rem; min-height: 2.25rem; gap: .5rem; }
 .admin-collection-body .admin-doc-name { font-size: .75rem; }
@@ -1596,8 +1670,41 @@ select.admin-input { cursor: pointer; appearance: auto; }
 .admin-doc-list { list-style: none; margin: .5rem 0 0; padding: 0; display: flex; flex-direction: column; gap: .4rem; }
 .admin-doc-item { display: flex; align-items: center; gap: .75rem; padding: .5rem .75rem; border-radius: var(--radius); background: var(--c-surface-2); border: 1px solid var(--c-border); min-height: 2.75rem; transition: border-color .12s ease; }
 .admin-doc-item:hover { border-color: var(--c-border-2); }
+.admin-doc-info { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; min-width: 0; flex: 1; }
 .admin-doc-name { flex: 1; min-width: 0; font-size: .8125rem; font-weight: 500; color: var(--c-text); word-break: break-all; line-height: 1.4; align-self: center; }
 .admin-doc-meta { font-size: .75rem; color: var(--c-text-4); white-space: nowrap; flex-shrink: 0; min-width: 4rem; text-align: right; }
+.admin-doc-year { font-size: .72rem; color: var(--c-text-3); background: var(--c-bg-2); border: 1px solid var(--c-border); border-radius: var(--radius-sm); padding: .1rem .35rem; }
+
+@media (max-width: 900px) {
+  .admin-doc-toolbar-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .admin-doc-toolbar-actions {
+    width: 100%;
+  }
+  .admin-doc-toolbar-actions .btn {
+    flex: 1;
+  }
+  .admin-doc-bulk-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .admin-doc-bulk-actions {
+    justify-content: stretch;
+  }
+  .admin-doc-bulk-actions .btn {
+    flex: 1;
+  }
+  .admin-doc-selected-count {
+    text-align: left;
+    min-width: 0;
+  }
+  .admin-doc-filters-row,
+  .admin-doc-filters-row--years {
+    grid-template-columns: 1fr;
+  }
+}
 
 .admin-docs-section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--c-border); }
 .admin-docs-section .admin-card-caption { margin-top: .25rem; margin-bottom: .75rem; }
