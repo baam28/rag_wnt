@@ -58,7 +58,6 @@ rag_wnt/
 │   └── package.json
 ├── docs/                # Source docs for ingestion
 ├── uploads/             # Uploaded files (runtime)
-├── qdrant_db/           # Vector DB data (runtime)
 ├── feedback.json        # Feedback store (runtime)
 ├── llm_usage.json       # LLM usage stats (runtime)
 └── README.md
@@ -68,6 +67,7 @@ rag_wnt/
 
 - Python 3.10+
 - Node.js 18+
+- Docker (for Qdrant)
 - MongoDB running locally (default: `mongodb://localhost:27017`)
 - OpenAI API key
 
@@ -87,6 +87,18 @@ MONGO_URI=mongodb://localhost:27017
 MONGO_DB_NAME=rag_chatbot
 LEGAL_COLLECTION_NAME=legal
 DRUG_COLLECTION_NAME=drug
+
+# Qdrant (Docker mode recommended)
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=
+
+# Optional: Hugging Face legal dataset ingest
+HF_LEGAL_DATASET_REPO=th1nhng0/vietnamese-legal-documents
+HF_LEGAL_METADATA_CONFIG=metadata
+HF_LEGAL_CONTENT_CONFIG=content
+HF_LEGAL_SPLIT=data
+HF_LEGAL_BATCH_SIZE=25
+HF_LEGAL_SKIP_SUMMARY_DEFAULT=true
 
 # Optional: users auto-marked admin at registration
 # JSON array format is safest with pydantic-settings
@@ -113,14 +125,20 @@ cd ..
 
 1) Start MongoDB.
 
-2) Start backend:
+2) Start Qdrant (Docker):
+
+```bash
+docker compose up -d qdrant
+```
+
+3) Start backend:
 
 ```bash
 cd backend
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-3) Start frontend dev server (optional, for hot reload):
+4) Start frontend dev server (optional, for hot reload):
 
 ```bash
 cd frontend
@@ -178,6 +196,7 @@ Then access:
 
 ### Ingest
 - `POST /ingest-file` (supports `?async=true`)
+- `POST /ingest-hf-legal` (default `?async=true`, Hugging Face legal dataset ingestion)
 - `GET /ingest-jobs/{job_id}`
 - `POST /ingest-jobs/{job_id}/cancel`
 
@@ -196,17 +215,36 @@ Then access:
 
 ## Ingestion Notes
 
-- Supported files: `.pdf`, `.docx`
+- Supported file ingest formats: `.pdf`, `.docx`
+- Hugging Face legal ingest: `POST /ingest-hf-legal`
+  - Key query params: `collection_name=legal`, `mode=default|proxy_strict`, `only_pharma_related=false|true`, `write_quarantine=false|true`, `quarantine_collection_name`, `limit`, `batch_size`, `start_offset`, `skip_summary`
+  - `mode=proxy_strict` applies proxy validity rules: legal type whitelist + latest-version dedupe by `issuance_date` (DD/MM/YYYY)
+  - `write_quarantine=true` stores rejected proxy rows into `<collection_name>_quarantine` (or your custom `quarantine_collection_name`)
+  - `skip_summary` defaults to your config (`HF_LEGAL_SKIP_SUMMARY_DEFAULT=true` recommended for fast backfill)
 - PDF parsing uses Docling markdown export.
 - Chunks are stored in Qdrant with parent/child metadata and sparse vocab side files.
-- To skip LLM summary generation during ingest, set `skip_summary=true` in form data.
+- To skip LLM summary generation during file ingest, set `skip_summary=true` in form data.
+- HF legal rows are stored with payload metadata fields like: `hf_id`, `title`, `legal_type`, `legal_sectors`, `issuing_authority`, `issuance_date`, `url`, `source_dataset`, `is_pharma_related`, `pharma_tags`.
+
+### HF dataset utilities
+
+Run from project root (with venv activated):
+
+```bash
+cd backend
+python hf_legal_query.py --limit 100
+python hf_legal_ingest.py --collection legal --skip-summary true --limit 500
+python hf_legal_ingest.py --collection legal --filter proxy_strict --skip-summary true --limit 500
+python hf_legal_ingest.py --collection legal --filter proxy_strict --write-quarantine true --quarantine-collection legal_quarantine --skip-summary true --limit 500
+```
+
+`hf_legal_query.py` returns pharmaceutical-related legal metadata rows using `legal_sectors` tags.
 
 ## Operational Notes
 
 - Runtime files created automatically:
   - `uploads/`
-  - `qdrant_db/`
-- Keep `qdrant_db/` and MongoDB data persisted in production.
+- Keep Docker Qdrant volume and MongoDB data persisted in production.
 - `/ask` rate limit uses JWT `sub` when available; falls back to IP.
 
 ## RAGAS Evaluation
@@ -274,4 +312,3 @@ EVAL_OUTPUT_DIR=eval_results
 
 Notes:
 - Running evaluation may consume significant OpenAI tokens, depending on sample count.
-- If local Qdrant is locked by another process, stop the running backend before evaluation.

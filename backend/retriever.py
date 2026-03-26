@@ -4,10 +4,8 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Any, Optional
 
-from cachetools import TTLCache
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
@@ -15,6 +13,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from config import get_settings
+from mongo_client import load_sparse_vocab_map, load_vector_parents
 from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
 
 logger = logging.getLogger(__name__)
@@ -375,13 +374,10 @@ def _query_to_sparse_vector(query: str, query_variations: list[str], vocab: dict
     return qmodels.SparseVector(indices=indices, values=values)
 
 
-def _load_sparse_vocab(persist_dir: Path, collection_name: str) -> dict[str, int] | None:
-    """Load sparse vocab for collection. Returns None if not found."""
-    path = persist_dir / f"{collection_name}_sparse_vocab.json"
-    if not path.exists():
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _load_sparse_vocab(collection_name: str) -> dict[str, int] | None:
+    """Load sparse vocab for collection from MongoDB. Returns None if not found."""
+    vocab = load_sparse_vocab_map(collection_name)
+    return vocab or None
 
 
 def hybrid_search(
@@ -390,15 +386,15 @@ def hybrid_search(
     embeddings,
     client: QdrantClient,
     collection_name: str,
-    persist_dir: Path,
     top_k: int = 20,
+    pharma_only: bool = False,
 ) -> list[tuple[str, dict, float]]:
     """
     Hybrid search using Qdrant native sparse + dense vectors (prefetch + RRF).
     Returns list of (doc_id, metadata, score) with payload.
     """
     q_embeddings = embeddings.embed_documents(query_variations)
-    sparse_vocab = _load_sparse_vocab(persist_dir, collection_name)
+    sparse_vocab = _load_sparse_vocab(collection_name)
     query_sparse = _query_to_sparse_vector(query, query_variations, sparse_vocab) if sparse_vocab else None
 
     prefetches: list[qmodels.Prefetch] = []
@@ -422,11 +418,23 @@ def hybrid_search(
     if not prefetches:
         return []
 
+    payload_filter = None
+    if pharma_only:
+        payload_filter = qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(
+                    key="is_pharma_related",
+                    match=qmodels.MatchValue(value=True),
+                )
+            ]
+        )
+
     resp = client.query_points(
         collection_name=collection_name,
         prefetch=prefetches,
         query=qmodels.FusionQuery(fusion=qmodels.Fusion.RRF),
         limit=top_k,
+        query_filter=payload_filter,
         with_payload=True,
         with_vectors=False,
     )
@@ -536,35 +544,9 @@ def rerank(
 
 # --- Parent context ---
 
-# Cache parent JSON files in memory for up to 5 minutes.
-# Each entry is keyed by (collection_name, file_mtime) so the cache
-# is automatically invalidated when the file is updated by a new ingest.
-_parents_cache: TTLCache = TTLCache(maxsize=32, ttl=300)
-_parents_cache_lock = threading.Lock()
-
-
 def load_parents(collection_name: str) -> dict[str, dict]:
-    """Load parent_id -> {content, summary, target_question, source} from JSON.
-
-    Results are cached in memory for up to 5 minutes and invalidated whenever
-    the underlying file changes (mtime-based key), so a new ingest is always
-    picked up within at most one cache period.
-    """
-    settings = get_settings()
-    path = settings.persist_dir / f"{collection_name}_parents.json"
-    if not path.exists():
-        return {}
-    mtime = path.stat().st_mtime
-    cache_key = (collection_name, mtime)
-    with _parents_cache_lock:
-        cached = _parents_cache.get(cache_key)
-        if cached is not None:
-            return cached
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    with _parents_cache_lock:
-        _parents_cache[cache_key] = data
-    return data
+    """Load parent_id -> {content, summary, target_question, source} from MongoDB."""
+    return load_vector_parents(collection_name)
 
 
 def fetch_parent_context(
@@ -615,6 +597,7 @@ def _retrieve_single_collection(
     settings,
     ingredient_hints: list[str] | None = None,
     context_pack: dict[str, Any] | None = None,
+    pharma_only: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Run full retrieval pipeline on a single collection.
@@ -635,8 +618,8 @@ def _retrieve_single_collection(
         embeddings,
         client,
         collection_name,
-        persist_dir=settings.persist_dir,
         top_k=settings.hybrid_top_k,
+        pharma_only=pharma_only,
     )
 
     if not candidates:
@@ -667,6 +650,7 @@ def retrieve(
     history: list[dict[str, str]] | None = None,
     ingredient_hints: list[str] | None = None,
     context_pack: dict[str, Any] | None = None,
+    pharma_only: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Run full retrieval using process-wide singleton clients.
@@ -682,7 +666,7 @@ def retrieve(
     # Singletons: first call initialises; subsequent calls return instantly.
     embeddings = get_embeddings()
     llm = get_llm()
-    client = get_qdrant_client(settings.persist_dir)
+    client = get_qdrant_client()
 
     if not collections_to_search:
         return []
@@ -706,7 +690,8 @@ def retrieve(
                 embeddings,
                 client,
                 coll_name,
-                persist_dir=settings.persist_dir, top_k=settings.hybrid_top_k
+                top_k=settings.hybrid_top_k,
+                pharma_only=pharma_only,
             )
             # Tag each candidate with its origin collection
             return [(doc_id, meta, score, coll_name) for (doc_id, meta, score) in candidates]

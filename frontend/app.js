@@ -676,7 +676,7 @@ function App() {
   async function handleDeleteCollection(name) {
     if (
       !window.confirm(
-        `Xóa toàn bộ collection '${name}' (tất cả chunk + metadata)?`
+        `Làm trống toàn bộ dữ liệu trong collection '${name}' (tất cả chunk + metadata)? Collection sẽ được giữ lại.`
       )
     ) {
       return;
@@ -690,11 +690,10 @@ function App() {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `Request failed with ${resp.status}`);
       }
-      if (selectedCollection === name) {
-        setSelectedCollection("");
-        setDocs([]);
-      }
       await fetchCollections();
+      if (selectedCollection === name) {
+        await fetchDocs(name);
+      }
     } catch (err) {
       console.error(err);
       setCollectionsError(String(err));

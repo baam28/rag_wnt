@@ -502,6 +502,18 @@ function AdminPage({
                   </div>
                   {selectedCollection === c.name && (
                     <div className="admin-collection-body">
+                      <div
+                        className="admin-actions"
+                        style={{ justifyContent: "flex-end", marginBottom: "0.75rem" }}
+                      >
+                        <button
+                          className="btn btn-danger btn-sm"
+                          onClick={() => handleDeleteCollection(c.name)}
+                          title={`Xóa toàn bộ dữ liệu trong collection '${c.name}'`}
+                        >
+                          Làm trống collection
+                        </button>
+                      </div>
                       {docsLoading && (
                         <p className="admin-status">Đang tải...</p>
                       )}

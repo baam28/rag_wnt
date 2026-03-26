@@ -8,8 +8,10 @@ from typing import Any
 
 try:
     from config import get_settings
+    from mongo_client import load_vector_parents
 except ImportError:  # pragma: no cover
     from backend.config import get_settings
+    from backend.mongo_client import load_vector_parents
 
 
 REQUIRED_FIELDS = {"question", "ground_truth", "collections"}
@@ -47,15 +49,8 @@ def load_curated_jsonl(path: str | Path, max_samples: int = 0) -> list[dict[str,
 
 
 def _build_synthetic_from_collection(collection_name: str, max_samples: int) -> list[dict[str, Any]]:
-    settings = get_settings()
-    parents_path = settings.persist_dir / f"{collection_name}_parents.json"
-    if not parents_path.exists():
-        return []
-
-    try:
-        with parents_path.open("r", encoding="utf-8") as file_obj:
-            parents = json.load(file_obj)
-    except (OSError, json.JSONDecodeError):
+    parents = load_vector_parents(collection_name)
+    if not parents:
         return []
 
     samples: list[dict[str, Any]] = []

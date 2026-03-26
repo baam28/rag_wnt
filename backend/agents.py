@@ -105,12 +105,17 @@ def run_federated_rag_agent(
     collections_to_search: list[str],
     history: Optional[List[Dict[str, str]]] = None,
     history_summary: Optional[str] = None,
+    pharma_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Retrieve from multiple collections in parallel. Use query reformulation if history provided."""
     context_pack = {"latest_summary": history_summary} if history_summary else None
     retrieval_query = reformulate_with_history(question, history or [], context_pack=context_pack)
     try:
-        return retrieve(retrieval_query, collections_to_search=collections_to_search)
+        return retrieve(
+            retrieval_query,
+            collections_to_search=collections_to_search,
+            pharma_only=pharma_only,
+        )
     except Exception:
         logger.error(
             "Federated RAG agent failed for collections=%s.",

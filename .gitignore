@@ -30,7 +30,6 @@ frontend/dist/
 .cursor/
 
 # Project runtime data
-qdrant_db/
 uploads/
 data/
 feedback.json

@@ -1,9 +1,7 @@
 """Admin router: collections, docs, users, analytics, feedback endpoints."""
 
-import json
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 from bson.objectid import ObjectId
@@ -24,6 +22,9 @@ from deps import (
     get_current_admin,
 )
 from mongo_client import (
+    count_vector_parents_by_source,
+    delete_collection_vector_meta,
+    delete_vector_parents_by_source,
     get_users_collection,
     get_chat_sessions_collection,
     get_chat_messages_collection,
@@ -216,7 +217,7 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
 @router.get("/admin/collections", response_model=list[CollectionInfo])
 def list_collections(current_user: CurrentUser = Depends(get_current_admin)):
     settings = get_settings()
-    client = get_qdrant_client(settings.persist_dir)
+    client = get_qdrant_client()
     try:
         resp = client.get_collections()
     except Exception as e:
@@ -229,20 +230,10 @@ def list_documents(
     collection_name: str = Query(..., alias="collection_name"),
     current_user: CurrentUser = Depends(get_current_admin),
 ):
-    settings = get_settings()
-    parents_path = settings.persist_dir / f"{collection_name}_parents.json"
-    if not parents_path.exists():
-        return []
     try:
-        with open(parents_path, "r", encoding="utf-8") as f:
-            parents = json.load(f)
+        counts = count_vector_parents_by_source(collection_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    counts: dict[str, int] = {}
-    for meta in parents.values():
-        src = meta.get("source", "Unknown")
-        counts[src] = counts.get(src, 0) + 1
     return [DocumentInfo(source=s, parent_count=n) for s, n in counts.items()]
 
 
@@ -252,7 +243,7 @@ def delete_document(
     current_user: CurrentUser = Depends(get_current_admin),
 ):
     settings = get_settings()
-    client = get_qdrant_client(settings.persist_dir)
+    client = get_qdrant_client()
 
     try:
         next_offset = None
@@ -286,16 +277,10 @@ def delete_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete points: {e}")
 
-    parents_path = settings.persist_dir / f"{req.collection_name}_parents.json"
-    if parents_path.exists():
-        try:
-            with open(parents_path, "r", encoding="utf-8") as f:
-                parents = json.load(f)
-            parents = {pid: meta for pid, meta in parents.items() if meta.get("source") != req.source}
-            with open(parents_path, "w", encoding="utf-8") as f:
-                json.dump(parents, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to update parents: {e}")
+    try:
+        delete_vector_parents_by_source(req.collection_name, req.source)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update metadata: {e}")
 
     return {"message": f"Deleted document '{req.source}' from collection '{req.collection_name}'."}
 
@@ -305,22 +290,42 @@ def delete_collection(
     collection_name: str,
     current_user: CurrentUser = Depends(get_current_admin),
 ):
-    settings = get_settings()
-    client = get_qdrant_client(settings.persist_dir)
+    client = get_qdrant_client()
     try:
-        client.delete_collection(collection_name=collection_name)
+        next_offset = None
+        deleted_points = 0
+        while True:
+            scroll_result, next_offset = client.scroll(
+                collection_name=collection_name,
+                limit=1000,
+                offset=next_offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            if not scroll_result:
+                break
+            point_ids = [p.id for p in scroll_result if p.id is not None]
+            if point_ids:
+                client.delete(
+                    collection_name=collection_name,
+                    points_selector=qmodels.PointIdsList(points=point_ids),
+                )
+                deleted_points += len(point_ids)
+            if next_offset is None:
+                break
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    for suffix in ("_parents.json", "_sparse_vocab.json"):
-        p = settings.persist_dir / f"{collection_name}{suffix}"
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception:
-                pass
+    try:
+        delete_collection_vector_meta(collection_name)
+    except Exception:
+        pass
 
-    return {"message": f"Deleted collection '{collection_name}' and related metadata."}
+    return {
+        "message": f"Cleared all data in collection '{collection_name}'.",
+        "collection_name": collection_name,
+        "deleted_points": deleted_points,
+    }
 
 
 # ---------------------------------------------------------------------------

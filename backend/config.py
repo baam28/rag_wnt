@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Embedding parallelism
     embed_batch_size: int = 64
     embed_max_workers: int = 4
+    qdrant_upsert_batch_size: int = 128
 
     # Retrieval
     query_expansion_count: int = 3
@@ -60,6 +61,41 @@ class Settings(BaseSettings):
     legal_collection_name: str = "legal"
     drug_collection_name: str = "drug"
 
+    # Hugging Face legal dataset ingestion
+    hf_legal_dataset_repo: str = "th1nhng0/vietnamese-legal-documents"
+    hf_legal_metadata_config: str = "metadata"
+    hf_legal_content_config: str = "content"
+    hf_legal_split: str = "data"
+    hf_legal_batch_size: int = 25
+    hf_legal_skip_summary_default: bool = True
+    hf_proxy_legal_type_whitelist: list[str] = [
+        "Luật",
+        "Nghị định",
+        "Thông tư",
+        "Văn bản hợp nhất",
+    ]
+    hf_proxy_prefer_vbhn: bool = True
+    hf_proxy_date_format: str = "%d/%m/%Y"
+    hf_pharma_sector_keywords: list[str] = [
+        "y tế",
+        "dược",
+        "thuốc",
+        "dược phẩm",
+        "dược liệu",
+        "vắc xin",
+        "vaccine",
+        "sinh phẩm",
+        "dược lâm sàng",
+        "nhà thuốc",
+        "quầy thuốc",
+        "kê đơn",
+        "gmp",
+        "gpp",
+        "gdp",
+        "bệnh",
+        "bệnh viện",
+    ]
+
     # MongoDB & auth
     mongo_uri: str = "mongodb://localhost:27017"
     mongo_db_name: str = "rag_chatbot"
@@ -79,9 +115,12 @@ class Settings(BaseSettings):
 
     # Paths (relative to project root)
     data_dir: Path = _BASE_DIR / "data"
-    persist_dir: Path = _BASE_DIR / "qdrant_db"
     upload_dir: Path = _BASE_DIR / "uploads"
     eval_output_dir: Path = _BASE_DIR / "eval_results"
+
+    # Qdrant connection (Docker/remote only)
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: str = ""
 
     class Config:
         env_file = str(_BASE_DIR / ".env")
