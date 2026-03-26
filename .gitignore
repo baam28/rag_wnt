@@ -6,6 +6,7 @@
 # Python
 .venv/
 venv/
+.pytest_cache/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -30,6 +31,8 @@ frontend/dist/
 .cursor/
 
 # Project runtime data
+check_db.py
+run_ingest.sh
 uploads/
 data/
 docs/
