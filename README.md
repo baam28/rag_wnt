@@ -40,12 +40,14 @@ rag_wnt/
 │   ├── config.py
 │   ├── ingest.py
 │   ├── retriever.py
+│   ├── hf_legal_ingest.py / hf_legal_query.py
 │   ├── supervisor.py / agents.py / prompts.py
 │   ├── routers/
 │   │   ├── auth.py
 │   │   ├── chat.py
 │   │   ├── ingest_router.py
 │   │   └── admin.py
+│   ├── eval/
 │   └── requirements.txt
 ├── frontend/
 │   ├── app.js
@@ -56,10 +58,8 @@ rag_wnt/
 │   ├── main.jsx
 │   ├── vite.config.js
 │   └── package.json
-├── docs/                # Source docs for ingestion
-├── uploads/             # Uploaded files (runtime)
-├── feedback.json        # Feedback store (runtime)
-├── llm_usage.json       # LLM usage stats (runtime)
+├── docker-compose.yml
+├── .env.example
 └── README.md
 ```
 
@@ -244,6 +244,8 @@ python hf_legal_ingest.py --collection legal --filter proxy_strict --write-quara
 
 - Runtime files created automatically:
   - `uploads/`
+  - `feedback.json`
+  - `llm_usage.json`
 - Keep Docker Qdrant volume and MongoDB data persisted in production.
 - `/ask` rate limit uses JWT `sub` when available; falls back to IP.
 
