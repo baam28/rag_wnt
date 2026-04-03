@@ -13,7 +13,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from config import get_settings
-from mongo_client import load_sparse_vocab_map, load_vector_parents
+from legal_tokenizer import legal_tokenize_query as _legal_tokenize_query
+from mongo_client import load_sparse_bm25_stats, load_sparse_vocab_map, load_vector_parents
 from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
 
 logger = logging.getLogger(__name__)
@@ -352,14 +353,26 @@ def reformulate_with_history(
 # --- Qdrant client & hybrid search ---
 
 
-def _query_to_sparse_vector(query: str, query_variations: list[str], vocab: dict[str, int]) -> qmodels.SparseVector | None:
-    """Build sparse vector for query + variations. Returns None if vocab empty or no tokens."""
+def _query_to_sparse_vector(
+    query: str,
+    query_variations: list[str],
+    vocab: dict[str, int],
+    idf_map: dict[str, float] | None = None,
+) -> qmodels.SparseVector | None:
+    """Build sparse vector for query + variations using BM25 IDF weighting.
+
+    Uses the legal tokenizer for Vietnamese legal reference expansion.
+    When ``idf_map`` is provided, applies IDF-only weighting (no document-length
+    normalization on the query side).  Falls back to ``1 + log(tf)`` when no
+    IDF stats are available.
+    """
     from math import log
     tokens: list[str] = []
-    tokens.extend(_tokenize_for_sparse(query))
+    tokens.extend(_legal_tokenize_query(query))
     for qv in query_variations:
-        tokens.extend(_tokenize_for_sparse(qv))
-    tf: dict[int, float] = {}
+        tokens.extend(_legal_tokenize_query(qv))
+
+    tf: dict[int, int] = {}
     for t in tokens:
         idx = vocab.get(t)
         if idx is None:
@@ -367,10 +380,21 @@ def _query_to_sparse_vector(query: str, query_variations: list[str], vocab: dict
         tf[idx] = tf.get(idx, 0) + 1
     if not tf:
         return None
-    for k in tf:
-        tf[k] = 1.0 + log(tf[k])
-    indices = sorted(tf.keys())
-    values = [float(tf[i]) for i in indices]
+
+    idx_to_token: dict[int, str] = {}
+    if idf_map:
+        idx_to_token = {v: k for k, v in vocab.items()}
+
+    scores: dict[int, float] = {}
+    for idx, raw_tf in tf.items():
+        if idf_map:
+            token = idx_to_token.get(idx, "")
+            scores[idx] = idf_map.get(token, 1.0) * (1.0 + log(raw_tf))
+        else:
+            scores[idx] = 1.0 + log(raw_tf)
+
+    indices = sorted(scores.keys())
+    values = [float(scores[i]) for i in indices]
     return qmodels.SparseVector(indices=indices, values=values)
 
 
@@ -395,7 +419,11 @@ def hybrid_search(
     """
     q_embeddings = embeddings.embed_documents(query_variations)
     sparse_vocab = _load_sparse_vocab(collection_name)
-    query_sparse = _query_to_sparse_vector(query, query_variations, sparse_vocab) if sparse_vocab else None
+    bm25_avgdl, bm25_idf_map = load_sparse_bm25_stats(collection_name) if sparse_vocab else (1.0, {})
+    query_sparse = (
+        _query_to_sparse_vector(query, query_variations, sparse_vocab, bm25_idf_map or None)
+        if sparse_vocab else None
+    )
 
     prefetches: list[qmodels.Prefetch] = []
     for qe in q_embeddings:

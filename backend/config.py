@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # Whether to apply context-aware rescoring after retrieval
     enable_context_rescore: bool = True
 
+    # BM25 sparse scoring parameters (Okapi BM25)
+    bm25_k1: float = 1.5   # term frequency saturation
+    bm25_b: float = 0.75   # document length normalization
+
     # Fixed collection names for the two domain-specific RAG agents.
     # Override in .env if your Qdrant collection names differ.
     legal_collection_name: str = "legal"

@@ -281,3 +281,47 @@ def insert_sparse_vocab_entries(collection_name: str, token_to_idx: dict[str, in
 def delete_collection_vector_meta(collection_name: str) -> None:
     get_vector_parents_collection().delete_many({"collection_name": collection_name})
     get_sparse_vocab_collection().delete_many({"collection_name": collection_name})
+    get_db()["vector_bm25_stats"].delete_many({"collection_name": collection_name})
+
+
+# ---------------------------------------------------------------------------
+# BM25 stats persistence (avgdl + per-token IDF)
+# ---------------------------------------------------------------------------
+
+def upsert_sparse_bm25_stats(
+    collection_name: str,
+    avgdl: float,
+    idf_map: dict[str, float],
+) -> None:
+    """Store BM25 corpus statistics for a collection.
+
+    Stores ``avgdl`` (average document length in tokens) and ``idf_map``
+    (token → Robertson IDF value) as a single document per collection.
+    Existing stats for the collection are replaced.
+    """
+    coll = get_db()["vector_bm25_stats"]
+    coll.create_index([("collection_name", ASCENDING)], unique=True)
+    now = datetime.now(timezone.utc)
+    coll.replace_one(
+        {"collection_name": collection_name},
+        {
+            "collection_name": collection_name,
+            "avgdl": avgdl,
+            "idf_map": idf_map,
+            "updated_at": now,
+        },
+        upsert=True,
+    )
+
+
+def load_sparse_bm25_stats(collection_name: str) -> tuple[float, dict[str, float]]:
+    """Load BM25 corpus statistics for a collection.
+
+    Returns ``(avgdl, idf_map)``.  Returns ``(1.0, {})`` if no stats have
+    been stored yet (falls back to TF-only weighting in that case).
+    """
+    coll = get_db()["vector_bm25_stats"]
+    doc = coll.find_one({"collection_name": collection_name}, {"_id": 0})
+    if not doc:
+        return 1.0, {}
+    return float(doc.get("avgdl", 1.0)), dict(doc.get("idf_map", {}))

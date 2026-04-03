@@ -20,9 +20,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from config import get_settings
+from legal_tokenizer import legal_tokenize as _legal_tokenize
 from mongo_client import (
     insert_sparse_vocab_entries,
+    load_sparse_bm25_stats,
     load_sparse_vocab_map,
+    upsert_sparse_bm25_stats,
     upsert_vector_parents,
 )
 from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
@@ -164,40 +167,86 @@ def _load_existing_hf_ids(collection_name: str) -> set[str]:
 # --- Sparse vector helpers (for Qdrant native sparse) ---
 
 
-def _build_vocab(texts: list[str], max_vocab_size: int = 100_000) -> dict[str, int]:
-    """Build token -> index vocabulary from corpus. Returns dict and saves nothing."""
+def _build_vocab(
+    texts: list[str],
+    max_vocab_size: int = 100_000,
+) -> tuple[dict[str, int], dict[str, float], float]:
+    """Build vocabulary and BM25 statistics from corpus.
+
+    Returns:
+        vocab:    token → index mapping (top-N by frequency)
+        idf_map:  token → Robertson IDF value
+        avgdl:    average document length in tokens
+    """
     from collections import Counter
-    counter: Counter[str] = Counter()
-    for t in texts:
-        counter.update(_tokenize_for_sparse(t))
-    vocab = {}
-    for token, _ in counter.most_common(max_vocab_size):
+    from math import log
+
+    doc_token_lists: list[list[str]] = [_legal_tokenize(t) for t in texts]
+    N = len(doc_token_lists)
+
+    corpus_counter: Counter[str] = Counter()
+    df_counter: Counter[str] = Counter()
+    total_tokens = 0
+    for token_list in doc_token_lists:
+        corpus_counter.update(token_list)
+        df_counter.update(set(token_list))
+        total_tokens += len(token_list)
+
+    avgdl = total_tokens / N if N > 0 else 1.0
+
+    vocab: dict[str, int] = {}
+    for token, _ in corpus_counter.most_common(max_vocab_size):
         vocab[token] = len(vocab)
-    return vocab
+
+    # Robertson IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+    idf_map: dict[str, float] = {}
+    for token in vocab:
+        df = df_counter.get(token, 0)
+        idf_map[token] = log((N - df + 0.5) / (df + 0.5) + 1.0)
+
+    return vocab, idf_map, avgdl
 
 
 def _text_to_sparse_vector(
     text: str,
     vocab: dict[str, int],
-    use_tf: bool = True,
+    idf_map: dict[str, float] | None = None,
+    avgdl: float = 1.0,
+    k1: float = 1.5,
+    b: float = 0.75,
 ) -> tuple[list[int], list[float]]:
-    """Convert text to (indices, values) for Qdrant SparseVector. Uses 1+log(tf)."""
+    """Convert text to (indices, values) for Qdrant SparseVector using BM25.
+
+    When ``idf_map`` is provided, applies the full Okapi BM25 formula with
+    document-length normalization.  Falls back to ``1 + log(tf)`` when
+    ``idf_map`` is None or empty.
+    """
     from math import log
-    tokens = _tokenize_for_sparse(text)
+    tokens = _legal_tokenize(text)
     if not tokens:
         return [], []
-    tf: dict[int, float] = {}
+    dl = len(tokens)
+    tf_raw: dict[int, int] = {}
     for t in tokens:
         idx = vocab.get(t)
         if idx is None:
             continue
-        tf[idx] = tf.get(idx, 0) + 1
-    if use_tf:
-        # Sublinear: 1 + log(tf)
-        for k in tf:
-            tf[k] = 1.0 + log(tf[k])
-    indices = sorted(tf.keys())
-    values = [float(tf[i]) for i in indices]
+        tf_raw[idx] = tf_raw.get(idx, 0) + 1
+
+    scores: dict[int, float] = {}
+    if idf_map:
+        idx_to_token = {v: k for k, v in vocab.items()}
+        for idx, raw_tf in tf_raw.items():
+            token = idx_to_token.get(idx, "")
+            idf = idf_map.get(token, 1.0)
+            tf_norm = (raw_tf * (k1 + 1)) / (raw_tf + k1 * (1 - b + b * dl / avgdl))
+            scores[idx] = idf * tf_norm
+    else:
+        for idx, raw_tf in tf_raw.items():
+            scores[idx] = 1.0 + log(raw_tf)
+
+    indices = sorted(scores.keys())
+    values = [float(scores[i]) for i in indices]
     return indices, values
 
 
@@ -947,7 +996,8 @@ def ingest_documents(
     progress("sparse", "Building sparse vocab and vectors...", 0, 1)
     existing_vocab = load_sparse_vocab_map(collection_name)
 
-    new_vocab = _build_vocab(child_texts)
+    cfg = get_settings()
+    new_vocab, idf_map, avgdl = _build_vocab(child_texts)
     merged_vocab = dict(existing_vocab)
     next_idx = max(merged_vocab.values(), default=-1) + 1
     added_vocab: dict[str, int] = {}
@@ -958,9 +1008,11 @@ def ingest_documents(
             next_idx += 1
 
     sparse_vectors: list[tuple[list[int], list[float]]] = [
-        _text_to_sparse_vector(t, merged_vocab) for t in child_texts
+        _text_to_sparse_vector(t, merged_vocab, idf_map, avgdl, cfg.bm25_k1, cfg.bm25_b)
+        for t in child_texts
     ]
     insert_sparse_vocab_entries(collection_name, added_vocab)
+    upsert_sparse_bm25_stats(collection_name, avgdl, idf_map)
     progress("sparse", f"Built sparse vocab ({len(merged_vocab)} terms)", 1, 1)
 
     _ensure_collection(client, collection_name, vector_size)
