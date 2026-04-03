@@ -25,15 +25,7 @@ class Settings(BaseSettings):
     llm_context_chunk_soft_cap_tokens: int = 320
 
     # Chunk sizes
-    child_chunk_tokens: int = 150
-    parent_chunk_tokens: int = 700
-    chunk_strategy: str = "auto"
-    parent_chunk_paragraphs: int = 4
-    child_chunk_paragraphs: int = 1
-    parent_chunk_sentences: int = 8
-    child_chunk_sentences: int = 3
-    parent_chunk_words: int = 400
-    child_chunk_words: int = 120
+    article_max_parent_tokens: int = 1200  # oversized articles are split further
 
     # Embedding parallelism
     embed_batch_size: int = 64

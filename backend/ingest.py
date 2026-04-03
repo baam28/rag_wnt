@@ -261,108 +261,117 @@ def _split_words(text: str) -> list[str]:
     return text.split()
 
 
-def split_by_paragraphs(text: str, max_paragraphs: int, overlap: int = 0) -> list[str]:
-    paras = _split_paragraphs(text)
-    if not paras:
-        return []
-    max_p = max(1, max_paragraphs)
-    chunks: list[str] = []
-    start = 0
-    while start < len(paras):
-        end = min(start + max_p, len(paras))
-        chunks.append("\n\n".join(paras[start:end]))
-        if end >= len(paras):
-            break
-        start = max(0, end - max(overlap, 0))
-    return chunks
+# --- Legal article parsing ---
+
+# Matches Vietnamese and English article markers at the start of a line.
+# Group 1: keyword (Điều/Article/Section), Group 2: number, Group 3: optional title text.
+_ARTICLE_RE = re.compile(
+    r"(?im)^(điều|article|section)\s+(\d+)[.:]?\s*(.*)",
+)
+
+# Matches chapter/part markers.
+# Group 1: keyword, Group 2: Roman or Arabic numeral, Group 3: optional title text.
+_CHAPTER_RE = re.compile(
+    r"(?im)^(chương|chapter|part|phần)\s+([IVXLCDM]+|\d+)[.:]?\s*(.*)",
+)
+
+# Matches numbered clause lines inside an article, e.g. "1. " or "  2. "
+_CLAUSE_RE = re.compile(r"(?m)^[ \t]*(\d+)\.\s+")
 
 
-def split_by_sentences(text: str, max_sentences: int, overlap: int = 1) -> list[str]:
-    sentences = _split_sentences(text)
-    if not sentences:
-        return []
-    max_s = max(1, max_sentences)
-    chunks: list[str] = []
-    start = 0
-    while start < len(sentences):
-        end = min(start + max_s, len(sentences))
-        chunks.append(" ".join(sentences[start:end]))
-        if end >= len(sentences):
-            break
-        start = max(0, end - max(overlap, 0))
-    return chunks
+def _detect_legal_articles(text: str) -> bool:
+    """Return True if *text* contains at least 5 article markers (Điều/Article/Section)."""
+    return len(_ARTICLE_RE.findall(text)) >= 5
 
 
-def split_by_words(text: str, max_words: int, overlap: int = 30) -> list[str]:
-    words = _split_words(text)
-    if not words:
-        return []
-    max_w = max(1, max_words)
-    chunks: list[str] = []
-    start = 0
-    while start < len(words):
-        end = min(start + max_w, len(words))
-        chunks.append(" ".join(words[start:end]))
-        if end >= len(words):
-            break
-        start = max(0, end - max(overlap, 0))
-    return chunks
+def _split_legal_articles(text: str) -> list[dict]:
+    """Parse *text* into a list of article dicts.
 
+    Each dict has:
+    - ``article_number`` (str): e.g. "15"
+    - ``article_title``  (str): heading text after "Điều 15."
+    - ``chapter_number`` (str): current chapter numeral, e.g. "II"
+    - ``chapter_title``  (str): current chapter heading text
+    - ``body``           (str): full article text including its header line
 
-def _estimate_doc_stats(documents: list[Document]) -> dict[str, float]:
-    """Compute simple statistics to drive auto chunking decisions."""
-    full_text_parts: list[str] = []
-    for d in documents:
-        if d and getattr(d, "page_content", None):
-            full_text_parts.append(str(d.page_content))
-    full_text = "\n\n".join(full_text_parts).strip()
-    if not full_text:
-        return {
-            "num_paragraphs": 0,
-            "num_sentences": 0,
-            "num_words": 0,
-            "avg_words_per_paragraph": 0.0,
-            "avg_words_per_sentence": 0.0,
-        }
-
-    paragraphs = _split_paragraphs(full_text)
-    sentences = _split_sentences(full_text)
-    words = _split_words(full_text)
-
-    num_paragraphs = len(paragraphs)
-    num_sentences = len(sentences)
-    num_words = len(words)
-
-    avg_words_per_paragraph = num_words / max(1, num_paragraphs)
-    avg_words_per_sentence = num_words / max(1, num_sentences)
-
-    return {
-        "num_paragraphs": num_paragraphs,
-        "num_sentences": num_sentences,
-        "num_words": num_words,
-        "avg_words_per_paragraph": avg_words_per_paragraph,
-        "avg_words_per_sentence": avg_words_per_sentence,
-    }
-
-
-def auto_select_chunk_strategy(documents: list[Document]) -> str:
+    Text before the first article is returned as a preamble entry with
+    ``article_number="0"``.
     """
-    Heuristic to choose a chunking strategy automatically:
-    - Prefer paragraph-based when documents are clearly structured into many paragraphs.
-    - Prefer sentence-based for long, dense prose.
-    - Fall back to semantic token-based when structure is unclear.
-    """
-    stats = _estimate_doc_stats(documents)
-    num_paragraphs = stats["num_paragraphs"]
-    num_sentences = stats["num_sentences"]
-    avg_words_per_paragraph = stats["avg_words_per_paragraph"]
-    avg_words_per_sentence = stats["avg_words_per_sentence"]
+    lines = text.splitlines(keepends=True)
 
-    if num_paragraphs >= 10 and 40 <= avg_words_per_paragraph <= 200:
-        return "paragraph"
-    if num_sentences >= 20 and 10 <= avg_words_per_sentence <= 60:
-        return "sentence"
-    return "semantic_tokens"
+    current_chapter_num = ""
+    current_chapter_title = ""
+
+    articles: list[dict] = []
+    buf: list[str] = []
+    current_article_num = "0"
+    current_article_title = ""
+    current_chapter_at_start = ""
+    current_chapter_title_at_start = ""
+
+    def _flush(buf, art_num, art_title, chap_num, chap_title):
+        body = "".join(buf).strip()
+        if body:
+            articles.append({
+                "article_number": art_num,
+                "article_title": art_title,
+                "chapter_number": chap_num,
+                "chapter_title": chap_title,
+                "body": body,
+            })
+
+    for line in lines:
+        stripped = line.strip()
+
+        chap_m = _CHAPTER_RE.match(stripped)
+        if chap_m:
+            _flush(buf, current_article_num, current_article_title,
+                   current_chapter_at_start, current_chapter_title_at_start)
+            buf = [line]
+            current_chapter_num = chap_m.group(2).strip()
+            current_chapter_title = chap_m.group(3).strip()
+            current_article_num = "0"
+            current_article_title = ""
+            current_chapter_at_start = current_chapter_num
+            current_chapter_title_at_start = current_chapter_title
+            continue
+
+        art_m = _ARTICLE_RE.match(stripped)
+        if art_m:
+            _flush(buf, current_article_num, current_article_title,
+                   current_chapter_at_start, current_chapter_title_at_start)
+            buf = [line]
+            current_article_num = art_m.group(2).strip()
+            current_article_title = art_m.group(3).strip()
+            current_chapter_at_start = current_chapter_num
+            current_chapter_title_at_start = current_chapter_title
+            continue
+
+        buf.append(line)
+
+    _flush(buf, current_article_num, current_article_title,
+           current_chapter_at_start, current_chapter_title_at_start)
+
+    return articles
+
+
+def _split_clauses(text: str) -> list[str]:
+    """Split article text on numbered clause markers (e.g. '1. ', '2. ').
+
+    Falls back to sentence splitting when fewer than 2 clauses are found.
+    """
+    matches = list(_CLAUSE_RE.finditer(text))
+    if len(matches) < 2:
+        return _split_sentences(text)
+
+    chunks: list[str] = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
 
 
 def _load_pdf_docling(path: Path, settings=None) -> list[Document]:
@@ -536,93 +545,53 @@ def semantic_parent_chunks(
     return parents
 
 
-def paragraph_parent_chunks(
+def article_parent_chunks(
     documents: list[Document],
-    parent_paragraphs: int,
+    parent_target_tokens: int,
+    embeddings: Any,
 ) -> list[Document]:
-    """Group documents into parent chunks by paragraphs."""
+    """Split legal documents into parent chunks, one per article (Điều/Article/Section).
+
+    Each article is kept as a single parent chunk.  If an article exceeds
+    *parent_target_tokens*, it is further split with RecursiveCharacterTextSplitter
+    while preserving the article-level metadata on every sub-chunk.
+
+    Falls back to :func:`semantic_parent_chunks` when no article markers are found.
+    """
+    char_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=parent_target_tokens * 4,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", ".", " ", ""],
+    )
+
     parents: list[Document] = []
     for doc in documents:
         text = doc.page_content or ""
-        paras = _split_paragraphs(text)
-        if not paras:
-            continue
-        current: list[str] = []
-        for p in paras:
-            current.append(p)
-            if len(current) >= max(1, parent_paragraphs):
-                parents.append(
-                    Document(
-                        page_content="\n\n".join(current),
-                        metadata=dict(doc.metadata),
-                    )
-                )
-                current = []
-        if current:
-            parents.append(
-                Document(
-                    page_content="\n\n".join(current),
-                    metadata=dict(doc.metadata),
-                )
+        if not _detect_legal_articles(text):
+            parents.extend(
+                semantic_parent_chunks([doc], parent_target_tokens, embeddings)
             )
-    return parents
-
-
-def sentence_parent_chunks(
-    documents: list[Document],
-    parent_sentences: int,
-) -> list[Document]:
-    """Group documents into parent chunks by sentence count."""
-    parents: list[Document] = []
-    for doc in documents:
-        text = doc.page_content or ""
-        sentences = _split_sentences(text)
-        if not sentences:
             continue
-        current: list[str] = []
-        for s in sentences:
-            current.append(s)
-            if len(current) >= max(1, parent_sentences):
-                parents.append(
-                    Document(
-                        page_content=" ".join(current),
-                        metadata=dict(doc.metadata),
-                    )
-                )
-                current = []
-        if current:
-            parents.append(
-                Document(
-                    page_content=" ".join(current),
-                    metadata=dict(doc.metadata),
-                )
-            )
-    return parents
 
+        article_dicts = _split_legal_articles(text)
+        for art in article_dicts:
+            if art["article_number"] == "0" and len(art["body"].split()) < 30:
+                continue
+            article_meta = {
+                **doc.metadata,
+                "article_number": art["article_number"],
+                "article_title": art["article_title"],
+                "chapter_number": art["chapter_number"],
+                "chapter_title": art["chapter_title"],
+                "chunk_strategy": "article",
+            }
+            if count_tokens(art["body"]) > parent_target_tokens:
+                article_doc = Document(page_content=art["body"], metadata=article_meta)
+                sub_splits = char_splitter.split_documents([article_doc])
+                parents.extend(sub_splits)
+            else:
+                parents.append(Document(page_content=art["body"], metadata=article_meta))
 
-def word_parent_chunks(
-    documents: list[Document],
-    parent_words: int,
-) -> list[Document]:
-    """Group documents into parent chunks by word count."""
-    parents: list[Document] = []
-    for doc in documents:
-        text = doc.page_content or ""
-        words = _split_words(text)
-        if not words:
-            continue
-        max_w = max(1, parent_words)
-        start = 0
-        while start < len(words):
-            end = min(start + max_w, len(words))
-            chunk_text = " ".join(words[start:end])
-            parents.append(
-                Document(
-                    page_content=chunk_text,
-                    metadata=dict(doc.metadata),
-                )
-            )
-            start = end
     return parents
 
 
@@ -631,84 +600,26 @@ def build_parent_chunks(
     settings,
     embeddings: Any,
 ) -> list[Document]:
+    """Build parent chunks using article-based chunking.
+
+    Each Điều/Article/Section becomes one parent chunk.  Documents without
+    article markers fall back to semantic (header-based) splitting.
     """
-    Build parent chunks according to configured strategy:
-    - semantic_tokens (default)
-    - paragraph
-    - sentence
-    - word
-    - auto (choose best heuristic based on document statistics)
-    """
-    strategy = getattr(settings, "chunk_strategy", "semantic_tokens") or "semantic_tokens"
-    strategy = strategy.lower()
-
-    if strategy == "auto":
-        # Use whole-document statistics to pick a concrete strategy
-        strategy = auto_select_chunk_strategy(documents)
-
-    if strategy == "paragraph":
-        return paragraph_parent_chunks(
-            documents,
-            parent_paragraphs=getattr(settings, "parent_chunk_paragraphs", 4),
-        )
-    if strategy == "sentence":
-        return sentence_parent_chunks(
-            documents,
-            parent_sentences=getattr(settings, "parent_chunk_sentences", 8),
-        )
-    if strategy == "word":
-        return word_parent_chunks(
-            documents,
-            parent_words=getattr(settings, "parent_chunk_words", 400),
-        )
-
-    # Fallback to existing semantic + token-based approach
-    return semantic_parent_chunks(
+    return article_parent_chunks(
         documents,
-        parent_target_tokens=getattr(settings, "parent_chunk_tokens", 700),
+        parent_target_tokens=getattr(settings, "article_max_parent_tokens", 1200),
         embeddings=embeddings,
     )
 
 
 def parent_to_children_dynamic(parent: Document, settings, *, effective_strategy: Optional[str] = None) -> list[Document]:
-    """
-    Split a parent chunk into child chunks according to the configured strategy.
-    - semantic_tokens: token-based windows
-    - paragraph: paragraphs per chunk
-    - sentence: sentences per chunk
-    - word: words per chunk
+    """Split a parent chunk into child chunks by clause (Khoản).
+
+    Splits on numbered clause markers (1. 2. …); falls back to sentences
+    when fewer than 2 clauses are found.
     """
     text = parent.page_content or ""
-    strategy = effective_strategy or getattr(settings, "chunk_strategy", "semantic_tokens") or "semantic_tokens"
-    strategy = strategy.lower()
-
-    if strategy == "auto":
-        strategy = auto_select_chunk_strategy([parent])
-
-    if strategy == "paragraph":
-        chunks = split_by_paragraphs(
-            text,
-            max_paragraphs=getattr(settings, "child_chunk_paragraphs", 1),
-            overlap=0,
-        )
-    elif strategy == "sentence":
-        chunks = split_by_sentences(
-            text,
-            max_sentences=getattr(settings, "child_chunk_sentences", 3),
-            overlap=1,
-        )
-    elif strategy == "word":
-        chunks = split_by_words(
-            text,
-            max_words=getattr(settings, "child_chunk_words", 120),
-            overlap=30,
-        )
-    else:
-        chunks = chunk_by_tokens(
-            text,
-            max_tokens=getattr(settings, "child_chunk_tokens", 150),
-            overlap=30,
-        )
+    chunks = _split_clauses(text)
 
     children: list[Document] = []
     for i, c in enumerate(chunks):
@@ -963,14 +874,8 @@ def ingest_documents(
         api_key=settings.openai_api_key,
         temperature=0.2,
     )
-    configured_strategy = getattr(settings, "chunk_strategy", "semantic_tokens") or "semantic_tokens"
-    configured_strategy = configured_strategy.lower()
-    if configured_strategy == "auto":
-        effective_strategy = auto_select_chunk_strategy(documents)
-        progress("semantic", f"Auto chunking (strategy: {effective_strategy})...", 0, 0)
-    else:
-        effective_strategy = configured_strategy
-        progress("semantic", f"Chunking ({effective_strategy})...", 0, 0)
+    progress("semantic", "Chunking (article)...", 0, 0)
+    effective_strategy = "article"
 
     parents = build_parent_chunks(
         documents=documents,
