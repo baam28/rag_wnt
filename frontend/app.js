@@ -1403,6 +1403,12 @@ export function MessageBubble({ message, onFeedback }) {
                     {s.collection_name && (
                       <span className="source-card-collection">{s.collection_name}</span>
                     )}
+                    {s.legal_type && (
+                      <span className="source-card-legal-type">{s.legal_type}</span>
+                    )}
+                    {s.issuance_date && (
+                      <span className="source-card-date">{s.issuance_date}</span>
+                    )}
                     <button
                       className="source-card-view-btn"
                       onClick={(e) => handleOpenDoc(s, e)}

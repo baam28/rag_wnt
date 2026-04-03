@@ -1281,6 +1281,8 @@ cite.chat-cite {
 .source-card-icon { font-size: .55rem; color: var(--c-text-4); width: .75rem; text-align: center; flex-shrink: 0; }
 .source-card-name { flex: 1; min-width: 0; font-weight: 600; color: var(--c-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .source-card-collection { font-size: .65rem; color: var(--c-brand-dark); background: var(--c-brand-muted); padding: .1rem .4rem; border-radius: var(--radius-full); flex-shrink: 0; white-space: nowrap; }
+.source-card-legal-type { font-size: .65rem; color: #7c5c00; background: #fff3cd; padding: .1rem .4rem; border-radius: var(--radius-full); flex-shrink: 0; white-space: nowrap; }
+.source-card-date { font-size: .65rem; color: var(--c-text-3); background: var(--c-surface-1); padding: .1rem .4rem; border-radius: var(--radius-full); flex-shrink: 0; white-space: nowrap; }
 .source-card-rank { font-size: .65rem; color: var(--c-text-4); flex-shrink: 0; }
 .source-card-summary { padding: 0 .55rem .3rem; font-size: .68rem; color: var(--c-text-3); line-height: 1.4; }
 .source-card-link { cursor: pointer; color: var(--c-brand) !important; text-decoration: underline; text-decoration-color: transparent; transition: text-decoration-color .12s ease; }
