@@ -1,4 +1,4 @@
-"""Retrieval: query expansion, hybrid search (vector + Qdrant native sparse), re-ranking, parent context."""
+"""Retrieval: query expansion, hybrid search (pgvector dense + BM25 sparse), re-ranking, parent context."""
 import json
 import logging
 import re
@@ -9,13 +9,16 @@ from typing import Any, Optional
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
 
 from config import get_settings
 from legal_tokenizer import legal_tokenize_query as _legal_tokenize_query
-from mongo_client import load_sparse_bm25_stats, load_sparse_vocab_map, load_vector_parents
-from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
+from pg_client import (
+    load_sparse_bm25_stats,
+    load_sparse_vocab_map,
+    load_vector_parents,
+    similarity_search,
+)
+from utils import fix_position_ids as _fix_position_ids, tokenize_for_sparse as _tokenize_for_sparse
 
 logger = logging.getLogger(__name__)
 
@@ -350,22 +353,13 @@ def reformulate_with_history(
     return question
 
 
-# --- Qdrant client & hybrid search ---
-
-
-def _query_to_sparse_vector(
+def _query_to_sparse_indices_values(
     query: str,
     query_variations: list[str],
     vocab: dict[str, int],
     idf_map: dict[str, float] | None = None,
-) -> qmodels.SparseVector | None:
-    """Build sparse vector for query + variations using BM25 IDF weighting.
-
-    Uses the legal tokenizer for Vietnamese legal reference expansion.
-    When ``idf_map`` is provided, applies IDF-only weighting (no document-length
-    normalization on the query side).  Falls back to ``1 + log(tf)`` when no
-    IDF stats are available.
-    """
+) -> tuple[list[int], list[float]]:
+    """Build sparse vector (indices, values) for query + variations using BM25 IDF weighting."""
     from math import log
     tokens: list[str] = []
     tokens.extend(_legal_tokenize_query(query))
@@ -379,7 +373,7 @@ def _query_to_sparse_vector(
             continue
         tf[idx] = tf.get(idx, 0) + 1
     if not tf:
-        return None
+        return [], []
 
     idx_to_token: dict[int, str] = {}
     if idf_map:
@@ -395,83 +389,81 @@ def _query_to_sparse_vector(
 
     indices = sorted(scores.keys())
     values = [float(scores[i]) for i in indices]
-    return qmodels.SparseVector(indices=indices, values=values)
+    return indices, values
 
 
 def _load_sparse_vocab(collection_name: str) -> dict[str, int] | None:
-    """Load sparse vocab for collection from MongoDB. Returns None if not found."""
+    """Load sparse vocab for collection from PostgreSQL. Returns None if not found."""
     vocab = load_sparse_vocab_map(collection_name)
     return vocab or None
+
+
+def _bm25_rescore(
+    rows: list[dict],
+    query_indices: list[int],
+    query_values: list[float],
+) -> list[dict]:
+    """Add a BM25 sparse score component to dense similarity results."""
+    if not query_indices or not rows:
+        return rows
+    q_vec = {idx: val for idx, val in zip(query_indices, query_values)}
+    for row in rows:
+        sparse_indices = row.get("sparse_indices") or []
+        sparse_values = row.get("sparse_values") or []
+        d_vec = {idx: val for idx, val in zip(sparse_indices, sparse_values)}
+        dot = sum(q_vec.get(idx, 0.0) * val for idx, val in d_vec.items())
+        dense_score = float(row.get("score", 0.0))
+        # Simple RRF-style combination: 0.7 dense + 0.3 sparse (normalised)
+        row["score"] = 0.7 * dense_score + 0.3 * min(dot, 1.0)
+    return rows
 
 
 def hybrid_search(
     query: str,
     query_variations: list[str],
     embeddings,
-    client: QdrantClient,
     collection_name: str,
     top_k: int = 20,
     pharma_only: bool = False,
 ) -> list[tuple[str, dict, float]]:
     """
-    Hybrid search using Qdrant native sparse + dense vectors (prefetch + RRF).
-    Returns list of (doc_id, metadata, score) with payload.
+    Hybrid search using pgvector dense + BM25 sparse re-scoring.
+    Returns list of (doc_id, metadata, score).
     """
     q_embeddings = embeddings.embed_documents(query_variations)
-    sparse_vocab = _load_sparse_vocab(collection_name)
-    bm25_avgdl, bm25_idf_map = load_sparse_bm25_stats(collection_name) if sparse_vocab else (1.0, {})
-    query_sparse = (
-        _query_to_sparse_vector(query, query_variations, sparse_vocab, bm25_idf_map or None)
-        if sparse_vocab else None
-    )
+    # Use the first embedding (primary query) for dense search
+    primary_embedding = q_embeddings[0] if q_embeddings else []
 
-    prefetches: list[qmodels.Prefetch] = []
-    for qe in q_embeddings:
-        prefetches.append(
-            qmodels.Prefetch(
-                query=qe,
-                using="dense",
-                limit=max(20, top_k),
-            )
-        )
-    if query_sparse is not None:
-        prefetches.append(
-            qmodels.Prefetch(
-                query=query_sparse,
-                using="sparse",
-                limit=max(20, top_k),
-            )
-        )
-
-    if not prefetches:
-        return []
-
-    payload_filter = None
-    if pharma_only:
-        payload_filter = qmodels.Filter(
-            must=[
-                qmodels.FieldCondition(
-                    key="is_pharma_related",
-                    match=qmodels.MatchValue(value=True),
-                )
-            ]
-        )
-
-    resp = client.query_points(
+    payload_filter = {"is_pharma_related": True} if pharma_only else None
+    rows = similarity_search(
         collection_name=collection_name,
-        prefetch=prefetches,
-        query=qmodels.FusionQuery(fusion=qmodels.Fusion.RRF),
-        limit=top_k,
-        query_filter=payload_filter,
-        with_payload=True,
-        with_vectors=False,
+        query_embedding=primary_embedding,
+        top_k=top_k,
+        payload_filter=payload_filter,
     )
+
+    # Load sparse vocab for BM25 enrichment
+    sparse_vocab = _load_sparse_vocab(collection_name)
+    if sparse_vocab:
+        _, bm25_idf_map = load_sparse_bm25_stats(collection_name)
+        q_indices, q_values = _query_to_sparse_indices_values(
+            query, query_variations, sparse_vocab, bm25_idf_map or None
+        )
+        rows = _bm25_rescore(rows, q_indices, q_values)
 
     out: list[tuple[str, dict, float]] = []
-    for point in (resp.points or []):
-        score = float(point.score) if point.score is not None else 0.0
-        payload = point.payload or {}
-        out.append((str(point.id), payload, score))
+    for row in rows:
+        score = float(row.get("score", 0.0))
+        payload = row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        # Attach sparse vectors so rerank can access them
+        payload["_sparse_indices"] = row.get("sparse_indices") or []
+        payload["_sparse_values"] = row.get("sparse_values") or []
+        out.append((str(row["id"]), payload, score))
     return out
 
 
@@ -621,7 +613,6 @@ def _retrieve_single_collection(
     collection_name: str,
     embeddings,
     llm: ChatOpenAI,
-    client: QdrantClient,
     settings,
     ingredient_hints: list[str] | None = None,
     context_pack: dict[str, Any] | None = None,
@@ -629,7 +620,7 @@ def _retrieve_single_collection(
 ) -> list[dict[str, Any]]:
     """
     Run full retrieval pipeline on a single collection.
-    Uses Qdrant native sparse + dense hybrid search (prefetch + RRF).
+    Uses pgvector dense + BM25 sparse hybrid search.
     Returns context list (may be empty).
     """
     variations = expand_query(
@@ -644,7 +635,6 @@ def _retrieve_single_collection(
         query,
         variations,
         embeddings,
-        client,
         collection_name,
         top_k=settings.hybrid_top_k,
         pharma_only=pharma_only,
@@ -694,7 +684,6 @@ def retrieve(
     # Singletons: first call initialises; subsequent calls return instantly.
     embeddings = get_embeddings()
     llm = get_llm()
-    client = get_qdrant_client()
 
     if not collections_to_search:
         return []
@@ -716,7 +705,6 @@ def retrieve(
                 effective_query,
                 query_variations,
                 embeddings,
-                client,
                 coll_name,
                 top_k=settings.hybrid_top_k,
                 pharma_only=pharma_only,

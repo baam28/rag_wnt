@@ -18,7 +18,7 @@ from deps import (
     CurrentUser,
     get_current_user,
 )
-from mongo_client import (
+from pg_client import (
     get_chat_sessions_collection,
     get_chat_messages_collection,
 )
@@ -35,7 +35,6 @@ from prompts import (
 )
 from supervisor import get_intent_from_supervisor
 from agents import run_price_agent, run_federated_rag_agent
-from drug_price_tool import detect_price_query, get_vietnam_drug_price
 from llm_usage import record_usage
 
 router = APIRouter(tags=["chat"])
@@ -102,19 +101,18 @@ def create_chat_session(
     coll = get_chat_sessions_collection()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     doc = {
-        "_id": str(uuid.uuid4()),
         "user_id": current_user.id,
         "title": title,
         "created_at": now,
         "updated_at": now,
     }
     coll.insert_one(doc)
-    return ChatSession(id=doc["_id"], title=doc["title"], created_at=doc["created_at"], updated_at=doc["updated_at"])
+    return ChatSession(id=str(doc["_id"]), title=doc["title"], created_at=doc["created_at"], updated_at=doc["updated_at"])
 
 
 @router.get("/chat/sessions", response_model=list[ChatSession])
 def list_chat_sessions(current_user: CurrentUser = Depends(get_current_user)):
-    docs = get_chat_sessions_collection().find({"user_id": current_user.id}).sort("updated_at", -1)
+    docs = get_chat_sessions_collection().find({"user_id": current_user.id})
     return [
         ChatSession(id=d["_id"], title=d.get("title", "New chat"), created_at=d.get("created_at", ""), updated_at=d.get("updated_at", ""))
         for d in docs
@@ -138,7 +136,7 @@ def get_chat_messages(
     session_id: str,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    docs = get_chat_messages_collection().find({"session_id": session_id, "user_id": current_user.id}).sort("created_at", 1)
+    docs = get_chat_messages_collection().find({"session_id": session_id, "user_id": current_user.id})
     return [
         ChatMessageOut(
             id=str(d["_id"]),
@@ -175,19 +173,17 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         history_payload = _sanitize_history(req.history)
         recent_history, history_summary = _prepare_history_for_prompt(history_payload)
 
-        # 1. Price agent
+        # 1. SQL Inventory Agent
         price_data, price_ctx = run_price_agent(req.question, intent)
-        is_price_question, _ = detect_price_query(req.question)
 
         # 2. RAG agent — routed by intent["collections_to_search"]
         collections = intent.get("collections_to_search", ["drug"])
         physical_collections = []
-        if not (intent.get("price") and is_price_question and (price_data or price_ctx)):
-            for c in collections:
-                if c == "legal":
-                    physical_collections.append(settings.legal_collection_name)
-                elif c == "drug":
-                    physical_collections.append(settings.drug_collection_name)
+        for c in collections:
+            if c == "legal":
+                physical_collections.append(settings.legal_collection_name)
+            elif c == "drug":
+                physical_collections.append(settings.drug_collection_name)
         if physical_collections:
             rag_docs = run_federated_rag_agent(
                 req.question,
@@ -206,9 +202,11 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         # 4. Choose prompt template
         has_rag = bool(rag_docs)
         has_price = price_ctx is not None
+        has_legal = "legal" in collections
         is_legal_only = collections == ["legal"] or physical_collections == [settings.legal_collection_name]
         is_drug_only = not has_price and (collections == ["drug"] or physical_collections == [settings.drug_collection_name])
-        if has_rag and has_price:
+        if has_rag and has_price and has_legal:
+            # Only use COMBINED when mixing legal docs with price data
             system_prompt = COMBINED_SYSTEM_PROMPT
             user_template = COMBINED_USER_PROMPT_TEMPLATE
         elif has_price:
@@ -251,20 +249,32 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         msgs_coll = get_chat_messages_collection()
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+        import uuid as _uuid
+        _NS = _uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+        def _canonical_session_id(raw: str, user_id: str) -> str:
+            """Return raw if it is already a valid UUID, otherwise derive a stable UUID v5."""
+            try:
+                _uuid.UUID(raw)
+                return raw
+            except (ValueError, AttributeError):
+                return str(_uuid.uuid5(_NS, f"{user_id}:{raw}"))
+
         session_id = req.session_id
         if session_id:
+            session_id = _canonical_session_id(session_id, current_user.id)
             sessions_coll.update_one(
                 {"_id": session_id, "user_id": current_user.id},
                 {"$set": {"updated_at": now}, "$setOnInsert": {"title": req.question.strip()[:80] or "New chat", "created_at": now}},
                 upsert=True,
             )
         else:
-            sess_doc = {"_id": str(uuid.uuid4()), "user_id": current_user.id, "title": req.question.strip()[:80] or "New chat", "created_at": now, "updated_at": now}
+            sess_doc = {"user_id": current_user.id, "title": req.question.strip()[:80] or "New chat", "created_at": now, "updated_at": now}
             sessions_coll.insert_one(sess_doc)
-            session_id = sess_doc["_id"]
+            session_id = str(sess_doc["_id"])
 
         msgs_coll.insert_one({"session_id": session_id, "user_id": current_user.id, "role": "user", "content": req.question, "created_at": now})
-        msgs_coll.insert_one({"session_id": session_id, "user_id": current_user.id, "role": "assistant", "content": answer, "created_at": now, "sources": sources, "priceData": price_data})
+        msgs_coll.insert_one({"session_id": session_id, "user_id": current_user.id, "role": "assistant", "content": answer, "created_at": now, "sources": sources, "priceData": None})
 
         return AskResponse(
             answer=answer,
@@ -272,6 +282,7 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             has_context=len(final_contexts) > 0,
             collection_name=final_contexts[0].get("collection_name") if final_contexts else None,
             price_data=price_data,
+            session_id=session_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

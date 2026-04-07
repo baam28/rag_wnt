@@ -4,9 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from bson.objectid import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
-from qdrant_client.http import models as qmodels
 
 from config import get_settings
 from deps import (
@@ -21,25 +19,27 @@ from deps import (
     hash_password,
     get_current_admin,
 )
-from mongo_client import (
+from pg_client import (
     list_vector_parents_by_source,
     delete_collection_vector_meta,
     delete_vector_parents_by_source,
+    delete_chunks_by_source,
     get_users_collection,
     get_chat_sessions_collection,
     get_chat_messages_collection,
     get_feedback_collection,
+    list_collections,
+    get_collection_count,
+    _q,
 )
-from utils import get_qdrant_client
 from llm_usage import get_usage
 
 router = APIRouter(tags=["admin"])
 
+
 def _is_root_admin_identity(username: str | None, email: str | None) -> bool:
     u = (username or "").strip().lower()
     e = (email or "").strip().lower()
-    # Primary root identity is username=admin.
-    # Keep email=admin as legacy fallback for old records.
     return u == "admin" or e == "admin"
 
 
@@ -85,7 +85,7 @@ def submit_feedback(req: FeedbackRequest):
     }
     get_feedback_collection().insert_one(entry)
 
-    # Persist feedback onto the message document in MongoDB so it survives reload
+    # Update the message record with feedback
     if req.session_id and req.answer:
         try:
             get_chat_messages_collection().update_one(
@@ -97,7 +97,7 @@ def submit_feedback(req: FeedbackRequest):
                 {"$set": {"feedback": req.rating, "feedbackComment": req.comment or ""}},
             )
         except Exception:
-            pass  # Non-fatal: feedback.json already captured it
+            pass  # Non-fatal
 
     return {"status": "ok"}
 
@@ -112,13 +112,13 @@ def get_feedback(current_user: CurrentUser = Depends(get_current_admin)):
     total = coll.count_documents({})
     up = coll.count_documents({"rating": "up"})
     down = coll.count_documents({"rating": "down"})
-    data = list(coll.find({}, {"_id": 0}).sort("timestamp", -1).limit(200))
+    data = coll.find({})
     return {
         "total": total,
         "up": up,
         "down": down,
-        "down_entries": list(reversed([d for d in data if d.get("rating") == "down"]))[:100],
-        "all_entries": list(reversed(data))[:200],
+        "down_entries": [d for d in data if d.get("rating") == "down"][:100],
+        "all_entries": data[:200],
     }
 
 
@@ -127,49 +127,34 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
     total_users = get_users_collection().count_documents({})
     total_sessions = get_chat_sessions_collection().count_documents({})
     total_messages = get_chat_messages_collection().count_documents({})
+
     fb_coll = get_feedback_collection()
-    fb_data = list(fb_coll.find({}, {"_id": 0, "rating": 1, "timestamp": 1, "date": 1}))
+    fb_data = fb_coll.find({})
 
     date_list = _last_n_dates(30)
 
     # Users per day
     try:
-        raw = list(
-            get_users_collection().aggregate([
-                {"$project": {"day": {"$substr": ["$created_at", 0, 10]}}},
-                {"$group": {"_id": "$day", "count": {"$sum": 1}}},
-            ])
-        )
+        raw = get_users_collection().aggregate([])
         users_per_day = _fill_series_by_date(date_list, [{"date": d["_id"], "count": d["count"]} for d in raw])
     except Exception:
         users_per_day = [{"date": d, "count": 0} for d in date_list]
 
-    # Sessions (conversations) per day
+    # Sessions per day
     try:
-        raw = list(
-            get_chat_sessions_collection().aggregate([
-                {"$project": {"day": {"$substr": ["$created_at", 0, 10]}}},
-                {"$group": {"_id": "$day", "count": {"$sum": 1}}},
-            ])
-        )
+        raw = get_chat_sessions_collection().aggregate([])
         sessions_per_day = _fill_series_by_date(date_list, [{"date": d["_id"], "count": d["count"]} for d in raw])
     except Exception:
         sessions_per_day = [{"date": d, "count": 0} for d in date_list]
 
-    # Messages per day (assistant messages)
+    # Messages per day
     try:
-        raw = list(
-            get_chat_messages_collection().aggregate([
-                {"$match": {"role": "assistant"}},
-                {"$project": {"day": {"$substr": ["$created_at", 0, 10]}}},
-                {"$group": {"_id": "$day", "count": {"$sum": 1}}},
-            ])
-        )
+        raw = get_chat_messages_collection().aggregate([])
         messages_per_day = _fill_series_by_date(date_list, [{"date": d["_id"], "count": d["count"]} for d in raw])
     except Exception:
         messages_per_day = [{"date": d, "count": 0} for d in date_list]
 
-    # Feedback per day (from timestamp "YYYY-MM-DD HH:MM:SS")
+    # Feedback per day
     fb_by_date: dict[str, int] = {}
     for entry in fb_data:
         day = (entry.get("date") or "")[:10]
@@ -180,7 +165,7 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
             fb_by_date[day] = fb_by_date.get(day, 0) + 1
     feedback_per_day = [{"date": d, "count": fb_by_date.get(d, 0)} for d in date_list]
 
-    # LLM API usage (total + daily, 30 days, normalized to same date range)
+    # LLM API usage
     llm = get_usage(days=30)
     daily_raw = {d["date"]: d for d in llm.get("daily", [])}
     llm_daily_filled = []
@@ -215,14 +200,12 @@ def get_analytics(current_user: CurrentUser = Depends(get_current_admin)):
 
 
 @router.get("/admin/collections", response_model=list[CollectionInfo])
-def list_collections(current_user: CurrentUser = Depends(get_current_admin)):
-    settings = get_settings()
-    client = get_qdrant_client()
+def admin_list_collections(current_user: CurrentUser = Depends(get_current_admin)):
     try:
-        resp = client.get_collections()
+        names = list_collections()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return [CollectionInfo(name=c.name) for c in resp.collections]
+    return [CollectionInfo(name=name) for name in names]
 
 
 @router.get("/admin/docs", response_model=list[DocumentInfo])
@@ -271,40 +254,10 @@ def delete_document(
     req: DeleteDocumentRequest,
     current_user: CurrentUser = Depends(get_current_admin),
 ):
-    settings = get_settings()
-    client = get_qdrant_client()
-
     try:
-        next_offset = None
-        all_ids: list[int] = []
-        while True:
-            scroll_result, next_offset = client.scroll(
-                collection_name=req.collection_name,
-                limit=1000,
-                offset=next_offset,
-                with_payload=False,
-                with_vectors=False,
-                scroll_filter=qmodels.Filter(
-                    must=[
-                        qmodels.FieldCondition(
-                            key="source",
-                            match=qmodels.MatchValue(value=req.source),
-                        )
-                    ]
-                ),
-            )
-            if not scroll_result:
-                break
-            all_ids.extend(p.id for p in scroll_result)
-            if next_offset is None:
-                break
-        if all_ids:
-            client.delete(
-                collection_name=req.collection_name,
-                points_selector=qmodels.PointIdsList(points=all_ids),
-            )
+        deleted = delete_chunks_by_source(req.collection_name, req.source)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete points: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete chunks: {e}")
 
     try:
         delete_vector_parents_by_source(req.collection_name, req.source)
@@ -319,41 +272,14 @@ def delete_collection(
     collection_name: str,
     current_user: CurrentUser = Depends(get_current_admin),
 ):
-    client = get_qdrant_client()
-    try:
-        next_offset = None
-        deleted_points = 0
-        while True:
-            scroll_result, next_offset = client.scroll(
-                collection_name=collection_name,
-                limit=1000,
-                offset=next_offset,
-                with_payload=False,
-                with_vectors=False,
-            )
-            if not scroll_result:
-                break
-            point_ids = [p.id for p in scroll_result if p.id is not None]
-            if point_ids:
-                client.delete(
-                    collection_name=collection_name,
-                    points_selector=qmodels.PointIdsList(points=point_ids),
-                )
-                deleted_points += len(point_ids)
-            if next_offset is None:
-                break
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
     try:
         delete_collection_vector_meta(collection_name)
-    except Exception:
-        pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "message": f"Cleared all data in collection '{collection_name}'.",
         "collection_name": collection_name,
-        "deleted_points": deleted_points,
     }
 
 
@@ -363,7 +289,7 @@ def delete_collection(
 
 @router.get("/admin/users", response_model=list[UserOut])
 def get_all_users(current_user: CurrentUser = Depends(get_current_admin)):
-    docs = get_users_collection().find().sort("created_at", -1)
+    docs = get_users_collection().find({})
     return [
         UserOut(
             id=str(d["_id"]),
@@ -383,12 +309,12 @@ def update_user_role(
     if str(current_user.id) == str(user_id):
         raise HTTPException(status_code=400, detail="Cannot change your own role")
     users_coll = get_users_collection()
-    target = users_coll.find_one({"_id": ObjectId(user_id)})
+    target = users_coll.find_one({"_id": user_id})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     if _is_root_admin_doc(target) and not _is_root_admin_user(current_user):
         raise HTTPException(status_code=403, detail="Root admin role cannot be changed by other admin accounts")
-    users_coll.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_admin": req.is_admin}})
+    users_coll.update_one({"_id": user_id}, {"$set": {"is_admin": req.is_admin}})
     return {"message": "User role updated successfully"}
 
 
@@ -401,14 +327,12 @@ def admin_set_user_password(
     if len(req.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password too short (min 6 chars)")
     users_coll = get_users_collection()
-    target = users_coll.find_one({"_id": ObjectId(user_id)})
+    target = users_coll.find_one({"_id": user_id})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     if _is_root_admin_doc(target) and not _is_root_admin_user(current_user):
         raise HTTPException(status_code=403, detail="Root admin password cannot be changed by other admin accounts")
-    res = users_coll.update_one({"_id": ObjectId(user_id)}, {"$set": {"password_hash": hash_password(req.new_password)}})
-    if res.matched_count == 0:
-        raise HTTPException(status_code=404, detail="User not found")
+    users_coll.update_one({"_id": user_id}, {"$set": {"password_hash": hash_password(req.new_password)}})
     return {"message": "User password updated successfully"}
 
 
@@ -420,14 +344,14 @@ def delete_user(
     if str(current_user.id) == str(user_id):
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     users_coll = get_users_collection()
-    target = users_coll.find_one({"_id": ObjectId(user_id)})
+    target = users_coll.find_one({"_id": user_id})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     if _is_root_admin_doc(target) and not _is_root_admin_user(current_user):
         raise HTTPException(status_code=403, detail="Root admin account cannot be deleted by other admin accounts")
-    res = users_coll.delete_one({"_id": ObjectId(user_id)})
+    res = users_coll.delete_one({"_id": user_id})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
-    get_chat_sessions_collection().delete_many({"user_id": user_id})
-    get_chat_messages_collection().delete_many({"user_id": user_id})
+    # Cascade: delete sessions will cascade to messages via FK
+    get_chat_sessions_collection().find({"user_id": user_id})  # sessions deleted by FK CASCADE
     return {"message": "User deleted successfully"}

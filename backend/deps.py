@@ -62,6 +62,7 @@ class AskResponse(BaseModel):
     has_context: bool
     collection_name: Optional[str] = None
     price_data: Optional[dict[str, Any]] = None
+    session_id: Optional[str] = None
 
 
 class IngestResponse(BaseModel):
@@ -214,10 +215,10 @@ def get_current_user(
 
     user_id = payload.get("sub")
     username = (payload.get("username") or payload.get("email") or "").strip()
-    email = payload.get("email")
+    email = payload.get("email") or ""
     is_admin = bool(payload.get("admin"))
 
-    if not user_id or not email:
+    if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
     return CurrentUser(id=user_id, username=username, email=email, is_admin=is_admin)

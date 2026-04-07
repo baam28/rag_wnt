@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # Embedding parallelism
     embed_batch_size: int = 64
     embed_max_workers: int = 4
-    qdrant_upsert_batch_size: int = 128
+    pgvector_upsert_batch_size: int = 128
 
     # Retrieval
     query_expansion_count: int = 3
@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     bm25_b: float = 0.75   # document length normalization
 
     # Fixed collection names for the two domain-specific RAG agents.
-    # Override in .env if your Qdrant collection names differ.
+    # Override in .env if your collection names differ.
     legal_collection_name: str = "legal"
     drug_collection_name: str = "drug"
 
@@ -92,14 +92,12 @@ class Settings(BaseSettings):
         "bệnh viện",
     ]
 
-    # MongoDB & auth
-    mongo_uri: str = "mongodb://localhost:27017"
-    mongo_db_name: str = "rag_chatbot"
+    # PostgreSQL database (replaces MongoDB + Qdrant)
+    database_url: str = "postgresql://admin:password@localhost:5433/pharmanet"
+
+    # Auth
     jwt_secret: str = "CHANGE_ME"
     jwt_algorithm: str = "HS256"
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    google_redirect_uri: str = ""
     admin_emails: list[str] = []
 
     # Evaluation (RAGAS)
@@ -113,10 +111,6 @@ class Settings(BaseSettings):
     data_dir: Path = _BASE_DIR / "data"
     upload_dir: Path = _BASE_DIR / "uploads"
     eval_output_dir: Path = _BASE_DIR / "eval_results"
-
-    # Qdrant connection (Docker/remote only)
-    qdrant_url: str = "http://localhost:6333"
-    qdrant_api_key: str = ""
 
     class Config:
         env_file = str(_BASE_DIR / ".env")

@@ -8,6 +8,17 @@ const HISTORY_MAX_TURNS = 4;
 const HISTORY_MAX_MESSAGES = HISTORY_MAX_TURNS * 2;
 const HISTORY_MAX_CHARS = 800;
 
+function generateUUID() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for older browsers
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
 function loadSessionsFromStorage() {
   try {
     const raw = window.localStorage.getItem("rag_chat_sessions");
@@ -275,7 +286,7 @@ function App() {
 
   function ensureActiveSession() {
     if (activeSessionId) return activeSessionId;
-    const newId = Math.random().toString(36).slice(2, 10);
+    const newId = generateUUID();
     const now = new Date().toISOString();
     const newSession = {
       id: newId,
@@ -329,7 +340,7 @@ function App() {
 
   function handleNewSession() {
     cancelInFlight({ restoreInput: false });
-    const id = Math.random().toString(36).slice(2, 10);
+    const id = generateUUID();
     const now = new Date().toISOString();
     const newSession = {
       id,
@@ -467,8 +478,19 @@ function App() {
       const sources = data.sources || [];
       const priceData = data.price_data || null;
 
+      // Sync to the server-assigned session ID (handles any mismatch)
+      const serverSessionId = data.session_id || sid;
+      if (serverSessionId !== sid) {
+        setActiveSessionId(serverSessionId);
+        setSessions((prev) =>
+          prev.map((s) => (s.id === sid ? { ...s, id: serverSessionId } : s))
+        );
+        pendingSessionIdRef.current = serverSessionId;
+      }
+      const effectiveSid = serverSessionId;
+
       if (!cancelAnimRef.current && requestId === activeRequestIdRef.current) {
-        await animateAnswer(sid, nextMessages, fullText, sources, priceData);
+        await animateAnswer(effectiveSid, nextMessages, fullText, sources, priceData);
       }
     } catch (err) {
       if (requestId !== activeRequestIdRef.current) return;
@@ -1282,8 +1304,6 @@ export function MessageBubble({ message, onFeedback }) {
     }
   };
 
-  const priceData = message.priceData || null;
-
   return (
     <div className={`chat-message ${isUser ? "user" : "assistant"}`}>
       {isUser ? (
@@ -1294,89 +1314,7 @@ export function MessageBubble({ message, onFeedback }) {
           dangerouslySetInnerHTML={{ __html: formatAssistantText(message.content) }}
         />
       )}
-      {!isUser && priceData && (priceData.drugs?.length > 0 || (priceData.prices?.length > 0 && !priceData.is_prescription)) && (() => {
-        const drugs = priceData.drugs?.length > 0
-          ? priceData.drugs
-          : (() => {
-              const byName = {};
-              for (const p of priceData.prices || []) {
-                const name = p.drug_name || "—";
-                if (!byName[name]) byName[name] = { drug_name: name, options: [], price_raw: null };
-                const raw = p.price_raw != null ? p.price_raw : parseInt(String(p.price).replace(/[\s.]/g, ""), 10) || 0;
-                byName[name].options.push({ unit: p.unit, price: p.price, price_raw: raw, source_name: p.source_name, source_url: p.source_url });
-              }
-              return Object.values(byName).map((d) => {
-                d.options.sort((a, b) => (a.price_raw || 0) - (b.price_raw || 0));
-                const c = d.options[0];
-                return { drug_name: d.drug_name, options: d.options, cheapest: { unit: c.unit, price: c.price, source_name: c.source_name, source_url: c.source_url } };
-              });
-            })();
-        const formatPriceWithUnit = (price, unit) => (unit ? `${price}/${unit}` : `${price}`);
-        return (
-          <div className="price-list">
-            <div className="price-list-header">
-              <div className="price-list-header-main">
-                <span className="price-list-title">{priceData.drug_name || "Giá thuốc"}</span>
-                <span className="price-list-subtitle">Bảng giá tham khảo</span>
-              </div>
-              {priceData.is_prescription && <span className="price-list-rx">Rx</span>}
-            </div>
-            {priceData.price_range && (
-              <div className="price-list-range"><strong>Khoảng giá:</strong> {priceData.price_range}</div>
-            )}
-            <ul className="price-list-drugs">
-              {drugs.map((d, di) => (
-                <li key={di} className="price-list-drug">
-                  <div className="price-list-drug-row">
-                    <span className="price-list-drug-name">{d.drug_name}</span>
-                    <span className="price-list-pill">Giá thấp nhất</span>
-                    <span className="price-list-drug-cheapest">
-                      {formatPriceWithUnit(d.cheapest.price, d.cheapest.unit)}
-                    </span>
-                    {d.cheapest.source_url && (
-                      <a className="price-list-link" href={d.cheapest.source_url} target="_blank" rel="noopener noreferrer" title="Xem tại nhà thuốc">Xem</a>
-                    )}
-                    {d.options.length > 1 && (
-                      <button type="button" className="price-list-expand-btn" onClick={() => toggleDrugExpand(d.drug_name)} aria-expanded={expandedDrugs.has(d.drug_name)}>
-                        {expandedDrugs.has(d.drug_name) ? "Thu gọn" : "Xem thêm"}
-                      </button>
-                    )}
-                  </div>
-                  {expandedDrugs.has(d.drug_name) && d.options.length > 1 && (
-                    <ul className="price-list-options">
-                      {d.options.map((opt, oi) => (
-                        <li key={oi} className="price-list-option">
-                          <span className="price-list-option-source">{opt.source_name || "Nhà thuốc"}</span>
-                          <span className="price-list-option-price">{formatPriceWithUnit(opt.price, opt.unit)}</span>
-                          {opt.source_url && (
-                            <a className="price-list-option-link" href={opt.source_url} target="_blank" rel="noopener noreferrer" title="Mở nguồn giá">Mở nguồn</a>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </li>
-              ))}
-            </ul>
-            {priceData.disclaimer && (
-              <div className="price-list-disclaimer">{priceData.disclaimer}</div>
-            )}
-          </div>
-        );
-      })()}
-      {!isUser && priceData && priceData.is_prescription && (!priceData.prices || priceData.prices.length === 0) && (
-        <div className="price-card price-card--rx">
-          <div className="price-card-header">
-            <span className="price-card-title">{priceData.drug_name || "Thuốc kê đơn"}</span>
-            <span className="price-card-rx">Rx</span>
-          </div>
-          <div className="price-card-range">{priceData.notes || "Thuốc kê đơn – giá không niêm yết."}</div>
-          <div className="price-card-source-line">Nguồn: Nhà thuốc Long Châu</div>
-          {priceData.disclaimer && (
-            <div className="price-card-disclaimer">{priceData.disclaimer}</div>
-          )}
-        </div>
-      )}
+
       {!isUser && hasSources && (
         <>
           {showSources && (

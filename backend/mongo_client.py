@@ -58,6 +58,13 @@ def get_llm_usage_collection() -> Collection[Any]:
     return get_db()["llm_usage_daily"]
 
 
+def get_drug_prices_collection() -> Collection[Any]:
+    coll = get_db()["drug_prices"]
+    coll.create_index([("drug_normalized", ASCENDING)])
+    coll.create_index([("drug_name", ASCENDING)])
+    return coll
+
+
 def get_vector_parents_collection() -> Collection[Any]:
     coll = get_db()["vector_parents"]
     coll.create_index([("collection_name", ASCENDING), ("parent_id", ASCENDING)], unique=True)

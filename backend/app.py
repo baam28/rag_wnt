@@ -62,8 +62,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 
 @app.on_event("startup")
-def _validate_settings() -> None:
-    """Validate critical secrets once at boot time."""
+def _startup() -> None:
+    """Validate critical secrets and initialize PostgreSQL connection pool."""
     logger = logging.getLogger(__name__)
     settings = get_settings()
 
@@ -75,6 +75,28 @@ def _validate_settings() -> None:
 
     if not settings.openai_api_key:
         logger.warning("OPENAI_API_KEY is not set. The /ask endpoint and ingestion will fail until it is configured.")
+
+    # Warm up the PostgreSQL connection pool
+    try:
+        from pg_client import get_pool
+        pool = get_pool()
+        logger.info("PostgreSQL connection pool initialized (min=%s, max=%s).", pool.min_size, pool.max_size)
+    except Exception as exc:
+        logger.error("Failed to initialize PostgreSQL pool: %s", exc)
+        raise
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    """Close the PostgreSQL connection pool gracefully."""
+    logger = logging.getLogger(__name__)
+    try:
+        from pg_client import _pool
+        if _pool is not None:
+            _pool.close()
+            logger.info("PostgreSQL connection pool closed.")
+    except Exception as exc:
+        logger.warning("Error closing PostgreSQL pool: %s", exc)
 
 
 # ---------------------------------------------------------------------------

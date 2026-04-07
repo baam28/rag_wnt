@@ -16,19 +16,18 @@ from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
-
 from config import get_settings
 from legal_tokenizer import legal_tokenize as _legal_tokenize
-from mongo_client import (
+from pg_client import (
     insert_sparse_vocab_entries,
-    load_sparse_bm25_stats,
     load_sparse_vocab_map,
     upsert_sparse_bm25_stats,
     upsert_vector_parents,
+    insert_vector_chunks,
+    get_collection_count,
+    load_existing_hf_ids,
 )
-from utils import fix_position_ids as _fix_position_ids, get_qdrant_client, tokenize_for_sparse as _tokenize_for_sparse
+from utils import fix_position_ids as _fix_position_ids, tokenize_for_sparse as _tokenize_for_sparse
 
 _ingest_logger = logging.getLogger(__name__)
 
@@ -123,45 +122,11 @@ def _sanitize_text_for_api(text: str) -> str:
 
 
 def _load_existing_hf_ids(collection_name: str) -> set[str]:
-    """Load existing hf_id values from a Qdrant collection to support resumable ingestion."""
-    existing: set[str] = set()
+    """Load existing hf_id values from PostgreSQL to support resumable ingestion."""
     try:
-        client = get_qdrant_client()
+        return load_existing_hf_ids(collection_name)
     except Exception:
-        return existing
-
-    try:
-        client.get_collection(collection_name)
-    except Exception:
-        return existing
-
-    offset = None
-    try:
-        while True:
-            points, next_offset = client.scroll(
-                collection_name=collection_name,
-                limit=1000,
-                offset=offset,
-                with_payload=["hf_id"],
-                with_vectors=False,
-            )
-            if not points:
-                break
-            for point in points:
-                payload = point.payload or {}
-                raw = payload.get("hf_id")
-                if raw is None:
-                    continue
-                hf_id = str(raw).strip()
-                if hf_id:
-                    existing.add(hf_id)
-            if next_offset is None:
-                break
-            offset = next_offset
-    except Exception:
-        return existing
-
-    return existing
+        return set()
 
 
 # --- Sparse vector helpers (for Qdrant native sparse) ---
@@ -724,7 +689,7 @@ TARGET_QUESTION: <câu hỏi mẫu>"""
         return parent.page_content[:200], "Nội dung đoạn văn là gì?"
 
 
-# --- Collection name & Qdrant client ---
+# --- Collection name ---
 
 def sanitize_collection_name(name: str) -> str:
     """Normalize collection name: 3-63 chars, alphanumeric/underscore/hyphen."""
@@ -742,46 +707,6 @@ def sanitize_collection_name(name: str) -> str:
     if not s[-1].isalnum():
         s = s + "1"
     return s[:63]
-
-
-
-def _ensure_collection(
-    client: QdrantClient,
-    collection_name: str,
-    vector_size: int,
-) -> None:
-    """Create collection if missing; recreate if schema is incompatible or corrupted."""
-    try:
-        info = client.get_collection(collection_name)
-        dense_cfg = None
-        vectors_cfg = getattr(info.config.params, "vectors", None)
-        if isinstance(vectors_cfg, dict):
-            dense_cfg = vectors_cfg.get("dense")
-        else:
-            dense_cfg = getattr(vectors_cfg, "dense", None)
-        if dense_cfg and getattr(dense_cfg, "size", None) == vector_size:
-            return
-        try:
-            client.delete_collection(collection_name)
-        except Exception:
-            pass
-    except Exception:
-        ...
-
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config={
-            "dense": qmodels.VectorParams(
-                size=vector_size,
-                distance=qmodels.Distance.COSINE,
-            ),
-        },
-        sparse_vectors_config={
-            "sparse": qmodels.SparseVectorParams(
-                index=qmodels.SparseIndexParams(on_disk=False),
-            ),
-        },
-    )
 
 
 def _noop_progress(step: str, msg: str, current: int = 0, total: int = 0) -> None:
@@ -864,26 +789,25 @@ def _parallel_embed(
     return result
 
 
-def _upsert_points_in_batches(
-    client: QdrantClient,
+def _insert_chunks_in_batches(
     collection_name: str,
-    points: list[qmodels.PointStruct],
+    records: list[dict],
     batch_size: int,
     progress_fn: Optional[Callable[[str, str, int, int], None]] = None,
 ) -> None:
-    if not points:
+    if not records:
         return
     effective_batch = max(1, int(batch_size or 128))
-    total = len(points)
+    total = len(records)
     batches = (total + effective_batch - 1) // effective_batch
     for i in range(batches):
         start = i * effective_batch
         end = min(start + effective_batch, total)
         if progress_fn:
-            progress_fn("qdrant", f"Writing chunks {start + 1}-{end}/{total}...", i, batches)
-        client.upsert(collection_name=collection_name, points=points[start:end])
+            progress_fn("pgvector", f"Writing chunks {start + 1}-{end}/{total}...", i, batches)
+        insert_vector_chunks(collection_name, records[start:end])
     if progress_fn:
-        progress_fn("qdrant", f"Writing chunks {total}/{total} complete", batches, batches)
+        progress_fn("pgvector", f"Writing chunks {total}/{total} complete", batches, batches)
 
 
 # --- Full file ingestion ---
@@ -966,7 +890,6 @@ def ingest_documents(
             child.metadata["target_question"] = target_question
             all_children.append(child)
 
-    client = get_qdrant_client()
     upsert_vector_parents(collection_name, parent_meta)
 
     child_texts = [_sanitize_text_for_api(c.page_content) for c in all_children]
@@ -1015,36 +938,32 @@ def ingest_documents(
     upsert_sparse_bm25_stats(collection_name, avgdl, idf_map)
     progress("sparse", f"Built sparse vocab ({len(merged_vocab)} terms)", 1, 1)
 
-    _ensure_collection(client, collection_name, vector_size)
-
-    try:
-        id_offset = client.count(collection_name=collection_name, exact=True).count
-    except Exception:
-        id_offset = 0
-
-    points: list[qmodels.PointStruct] = []
+    # Build chunk records for pgvector
+    records: list[dict] = []
     for i in range(len(child_texts)):
         indices, values = sparse_vectors[i]
-        point_kwargs: dict[str, Any] = {
-            "id": id_offset + i,
-            "vector": {"dense": child_embeddings[i]},
+        child = all_children[i]
+        parent_id = child.metadata.get("parent_id", "")
+        records.append({
+            "parent_id": parent_id,
+            "chunk_index": int(child.metadata.get("chunk_index", i)),
+            "text": child_texts[i],
+            "embedding": child_embeddings[i],
+            "sparse_indices": indices,
+            "sparse_values": values,
             "payload": {**child_metadatas[i], "text": child_texts[i]},
-        }
-        if indices:
-            sparse_vec = qmodels.SparseVector(indices=indices, values=values)
-            point_kwargs["vector"]["sparse"] = sparse_vec
-        points.append(qmodels.PointStruct(**point_kwargs))
+            "hf_id": child_metadatas[i].get("hf_id"),
+        })
 
-    progress("qdrant", f"Writing {len(points)} chunks to Qdrant...", 0, 1)
-    _upsert_points_in_batches(
-        client,
+    progress("pgvector", f"Writing {len(records)} chunks to PostgreSQL...", 0, 1)
+    _insert_chunks_in_batches(
         collection_name=collection_name,
-        points=points,
-        batch_size=getattr(settings, "qdrant_upsert_batch_size", 128),
+        records=records,
+        batch_size=getattr(settings, "pgvector_upsert_batch_size", 128),
         progress_fn=progress,
     )
 
-    total_in_db = client.count(collection_name=collection_name, exact=True).count
+    total_in_db = get_collection_count(collection_name)
     progress("done", f"Done: {len(parents)} parents, {len(all_children)} children", 1, 1)
 
     return {

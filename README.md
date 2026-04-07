@@ -1,6 +1,7 @@
-# PharmaAI RAG (Drug + Legal Assistant)
+# PharmaAI RAG — Vietnamese Drug & Legal Assistant
 
-A full-stack RAG assistant for Vietnamese pharmacy workflows:
+A full-stack RAG chatbot for Vietnamese pharmacy workflows:
+
 - Drug information Q&A (`drug` collection)
 - Legal/pharmacy regulation Q&A (`legal` collection)
 - Real-time drug price lookup integration
@@ -8,72 +9,121 @@ A full-stack RAG assistant for Vietnamese pharmacy workflows:
 
 ## Tech Stack
 
-- Backend: FastAPI, LangChain, Qdrant, MongoDB
-- LLM/Embeddings: OpenAI (`gpt-4o-mini`, `text-embedding-3-small` by default)
-- Retrieval: hybrid dense + sparse, reranking with CrossEncoder
-- Ingestion: PDF (Docling), DOCX (python-docx)
-- Frontend: React + Vite (SPA served from `frontend/dist`)
+- **Backend**: FastAPI, LangChain, psycopg (PostgreSQL v3 driver)
+- **Database**: PostgreSQL 16 + pgvector (vector similarity) + pg_trgm (fuzzy search)
+- **LLM / Embeddings**: OpenAI (`gpt-4o-mini`, `text-embedding-3-small` by default)
+- **Retrieval**: Hybrid dense (pgvector) + sparse (BM25), reranked with CrossEncoder
+- **Ingestion**: PDF (Docling), DOCX (python-docx), Hugging Face datasets
+- **Frontend**: React 18 + Vite (SPA served from `frontend/dist`)
 
-## Current Architecture
+## Architecture
 
-- `backend/app.py`
-  - Registers routers: auth, chat, admin, ingest
-  - Enforces startup secret check (`JWT_SECRET` must not be `CHANGE_ME`)
-  - Adds request rate limiting (`/ask`) and CORS
-  - Serves built frontend at `/app` and `/admin`
-- `backend/routers/auth.py`
-  - Local register/login/password-change with JWT
-- `backend/routers/chat.py`
-  - `/ask` federates intent-based retrieval + optional live price context
-  - Mongo-backed chat sessions/messages
-- `backend/routers/ingest_router.py`
-  - Sync ingest and async ingest jobs (`/ingest-jobs/{job_id}`)
-- `backend/routers/admin.py`
-  - Collection/doc management, user admin, feedback, analytics, DB clear
+```
+┌────────────────────────────────────────────────────────────┐
+│                  React Frontend (Vite)                     │
+│  Chat sessions · Auth · Admin dashboard · File upload      │
+└──────────────────────────┬─────────────────────────────────┘
+                           │ HTTP / JWT
+┌──────────────────────────▼─────────────────────────────────┐
+│                FastAPI Backend (Python)                     │
+│  Auth · Chat · Admin · Ingest routers                      │
+├────────────────────────────────────────────────────────────┤
+│  Retrieval: Hybrid Search                                  │
+│  · Dense  — pgvector cosine similarity (IVFFlat index)     │
+│  · Sparse — BM25 (precomputed vocab + Robertson IDF)       │
+│  · Rerank — CrossEncoder (mMiniLMv2-L12-H384)             │
+├────────────────────────────────────────────────────────────┤
+│  Ingestion Pipeline                                        │
+│  · Load  — PDF (Docling markdown), DOCX (python-docx)     │
+│  · Parse — Legal articles (Điều/Article/Section) + clauses │
+│  · Chunk — Token-based parent-child hierarchy              │
+│  · Store — PostgreSQL (dense + sparse vectors + metadata)  │
+├────────────────────────────────────────────────────────────┤
+│  LLM: OpenAI GPT-4o-mini                                   │
+│  · Query expansion · Reformulation · Summaries             │
+└──────────────────────────┬─────────────────────────────────┘
+                           │
+┌──────────────────────────▼─────────────────────────────────┐
+│           PostgreSQL 16 + pgvector (Docker)                │
+│  users · chat_sessions · chat_messages                     │
+│  vector_chunks · vector_parents                            │
+│  vector_sparse_vocab · vector_bm25_stats                   │
+│  drug_list · drug_inventory                                │
+│  feedback · llm_usage_daily                                │
+└────────────────────────────────────────────────────────────┘
+```
 
 ## Project Layout
 
 ```text
 rag_wnt/
 ├── backend/
-│   ├── app.py
-│   ├── config.py
-│   ├── ingest.py
-│   ├── retriever.py
-│   ├── hf_legal_ingest.py / hf_legal_query.py
-│   ├── supervisor.py / agents.py / prompts.py
+│   ├── app.py                  # FastAPI app, routers, middleware
+│   ├── config.py               # Pydantic settings (env vars)
+│   ├── pg_client.py            # PostgreSQL connection pool + all DB operations
+│   ├── schema.sql              # Full DB schema (auto-applied on first Docker run)
+│   ├── ingest.py               # Ingestion pipeline (chunking, embedding, storage)
+│   ├── retriever.py            # Hybrid search, reranking, query expansion
+│   ├── agents.py               # RAG agent runners (federated + price)
+│   ├── supervisor.py           # Intent classification (legal / drug / general)
+│   ├── prompts.py              # LLM prompt templates
+│   ├── drug_price_tool.py      # Live drug price lookup tool
+│   ├── llm_usage.py            # Token usage tracking
+│   ├── utils.py                # Shared helpers
+│   ├── legal_tokenizer.py      # Vietnamese legal document tokenizer
 │   ├── routers/
-│   │   ├── auth.py
-│   │   ├── chat.py
-│   │   ├── ingest_router.py
-│   │   └── admin.py
-│   ├── eval/
-│   └── requirements.txt
+│   │   ├── auth.py             # Register · Login · Change password
+│   │   ├── chat.py             # /ask · sessions · messages
+│   │   ├── ingest_router.py    # File upload · HF legal dataset · async jobs
+│   │   └── admin.py            # Collections · docs · users · analytics · feedback
+│   ├── scripts/
+│   │   └── scrape_longchau.py  # Playwright scraper → drug_list / drug_inventory
+│   └── eval/
+│       ├── ragas_runner.py     # RAGAS evaluation runner
+│       └── datasets/
+│           └── curated.jsonl   # Evaluation dataset
 ├── frontend/
-│   ├── app.js
-│   ├── chat_page.js
-│   ├── admin_page.js
-│   ├── landing.js
+│   ├── app.js                  # Main React component (auth, sessions, admin)
+│   ├── chat_page.js            # Chat UI
+│   ├── admin_page.js           # Admin dashboard UI
+│   ├── landing.js              # Login / register page
 │   ├── styles.css
 │   ├── main.jsx
 │   ├── vite.config.js
 │   └── package.json
-├── docker-compose.yml
+├── docker-compose.yml          # PostgreSQL + pgvector service
 ├── .env.example
 └── README.md
 ```
+
+## Database Schema
+
+All tables are defined in `backend/schema.sql` and applied automatically on first Docker start.
+
+| Table | Purpose |
+|---|---|
+| `users` | Auth: username, email, password_hash, is_admin |
+| `chat_sessions` | Chat sessions per user |
+| `chat_messages` | Messages with role, content, sources (JSONB), feedback |
+| `vector_chunks` | Child chunks: dense embedding + sparse BM25 indices/values + payload (JSONB) |
+| `vector_parents` | Parent chunk metadata: content, summary, target_question, source |
+| `vector_sparse_vocab` | BM25 vocabulary: token → index per collection |
+| `vector_bm25_stats` | BM25 stats: avgdl + idf_map (JSONB) per collection |
+| `drug_list` | Drug catalog: name, active ingredient, dosage form, therapeutic class |
+| `drug_inventory` | Drug inventory: price, stock, expiry (scraped from Long Châu) |
+| `feedback` | User ratings on answers |
+| `llm_usage_daily` | Token usage per date |
 
 ## Prerequisites
 
 - Python 3.10+
 - Node.js 18+
-- Docker (for Qdrant)
-- MongoDB running locally (default: `mongodb://localhost:27017`)
+- Docker (for PostgreSQL + pgvector)
 - OpenAI API key
 
 ## Environment Variables
 
-Create `.env` at project root:
+Create `.env` at the project root (or in `backend/`):
 
 ```env
 OPENAI_API_KEY=sk-...
@@ -82,17 +132,17 @@ JWT_SECRET=replace-with-strong-random-secret-at-least-32-chars
 # Optional overrides
 LLM_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
+RERANKER_MODEL=cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
 ASK_RATE_LIMIT=20/minute
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB_NAME=rag_chatbot
+
+# PostgreSQL (matches docker-compose defaults)
+DATABASE_URL=postgresql://admin:password@localhost:5433/pharmanet
+
+# Collections
 LEGAL_COLLECTION_NAME=legal
 DRUG_COLLECTION_NAME=drug
 
-# Qdrant (Docker mode recommended)
-QDRANT_URL=http://localhost:6333
-QDRANT_API_KEY=
-
-# Optional: Hugging Face legal dataset ingest
+# Optional: Hugging Face legal dataset
 HF_LEGAL_DATASET_REPO=th1nhng0/vietnamese-legal-documents
 HF_LEGAL_METADATA_CONFIG=metadata
 HF_LEGAL_CONTENT_CONFIG=content
@@ -100,22 +150,21 @@ HF_LEGAL_SPLIT=data
 HF_LEGAL_BATCH_SIZE=25
 HF_LEGAL_SKIP_SUMMARY_DEFAULT=true
 
-# Optional: users auto-marked admin at registration
-# JSON array format is safest with pydantic-settings
+# Optional: auto-admin at registration (JSON array)
 ADMIN_EMAILS=["admin@example.com"]
 ```
 
-Important:
-- Backend startup fails if `JWT_SECRET` is left as `CHANGE_ME`.
-- If `OPENAI_API_KEY` is missing, `/ask` and summary generation will fail.
+> **Note**: The backend will refuse to start if `JWT_SECRET` is left as `CHANGE_ME`. `/ask` and ingestion require a valid `OPENAI_API_KEY`.
 
 ## Install
 
 ```bash
+# Backend
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 
+# Frontend
 cd frontend
 npm install
 cd ..
@@ -123,22 +172,22 @@ cd ..
 
 ## Run (Development)
 
-1) Start MongoDB.
-
-2) Start Qdrant (Docker):
+**1. Start PostgreSQL + pgvector:**
 
 ```bash
-docker compose up -d qdrant
+docker compose up -d
 ```
 
-3) Start backend:
+The schema is applied automatically from `backend/schema.sql` on first run.
+
+**2. Start backend:**
 
 ```bash
 cd backend
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-4) Start frontend dev server (optional, for hot reload):
+**3. Start frontend dev server (optional, for hot reload):**
 
 ```bash
 cd frontend
@@ -147,131 +196,126 @@ npm run dev
 
 Vite proxies API calls to `http://localhost:8000`.
 
-## Run (Single-server via FastAPI static mount)
+## Run (Production — Single Server)
 
-Build frontend and let FastAPI serve it:
+Build the frontend and let FastAPI serve it as static files:
 
 ```bash
-cd frontend
-npm run build
-cd ../backend
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+cd frontend && npm run build
+cd ../backend && uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Then access:
+Access:
 - App: `http://localhost:8000/app/`
-- Admin route: `http://localhost:8000/admin/` (same SPA)
+- Admin: `http://localhost:8000/admin/`
 - API docs: `http://localhost:8000/docs`
-
-## Main Features
-
-- JWT auth (register/login/change password)
-- Chat sessions per user (MongoDB)
-- Intent-based routing across legal/drug collections
-- Combined answering when question needs both domains
-- Price-agent integration for Vietnamese pharmacy price lookups
-- Async ingestion jobs with polling + cancel
-- Admin tools:
-  - Collection/document management in Qdrant
-  - Clear full vector DB
-  - User role/password management
-  - Feedback review
-  - 30-day analytics (users/sessions/messages/feedback + token usage)
 
 ## API Endpoints
 
 ### Auth
-- `POST /auth/register`
-- `POST /auth/login`
-- `PUT /auth/password`
+| Method | Path | Description |
+|---|---|---|
+| POST | `/auth/register` | Register new user |
+| POST | `/auth/login` | Login, returns JWT |
+| PUT | `/auth/password` | Change own password |
 
 ### Chat
-- `GET /health`
-- `POST /ask`
-- `POST /chat/sessions`
-- `GET /chat/sessions`
-- `DELETE /chat/sessions/{session_id}`
-- `GET /chat/sessions/{session_id}/messages`
-- `POST /drug-price`
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Health check |
+| POST | `/ask` | Main RAG endpoint (rate-limited) |
+| POST | `/chat/sessions` | Create session |
+| GET | `/chat/sessions` | List sessions |
+| DELETE | `/chat/sessions/{id}` | Delete session |
+| GET | `/chat/sessions/{id}/messages` | Get messages |
+| POST | `/drug-price` | Live price lookup |
 
 ### Ingest
-- `POST /ingest-file` (supports `?async=true`)
-- `POST /ingest-hf-legal` (default `?async=true`, Hugging Face legal dataset ingestion)
-- `GET /ingest-jobs/{job_id}`
-- `POST /ingest-jobs/{job_id}/cancel`
+| Method | Path | Description |
+|---|---|---|
+| POST | `/ingest-file` | Upload PDF/DOCX (`?async=true` for background job) |
+| POST | `/ingest-hf-legal` | Ingest from Hugging Face legal dataset (async by default) |
+| GET | `/ingest-jobs/{job_id}` | Poll async job status |
+| POST | `/ingest-jobs/{job_id}/cancel` | Cancel async job |
 
-### Feedback + Admin
-- `POST /feedback` (public)
-- `GET /admin/feedback`
-- `GET /admin/analytics`
-- `GET /admin/collections`
-- `GET /admin/docs?collection_name=...`
-- `DELETE /admin/docs`
-- `DELETE /admin/collections/{collection_name}`
-- `GET /admin/users`
-- `PUT /admin/users/{user_id}/role`
-- `PUT /admin/users/{user_id}/password`
-- `DELETE /admin/users/{user_id}`
+### Admin (requires admin role)
+| Method | Path | Description |
+|---|---|---|
+| POST | `/feedback` | Submit feedback (public) |
+| GET | `/admin/feedback` | View all feedback |
+| GET | `/admin/analytics` | 30-day dashboard stats + token usage |
+| GET | `/admin/collections` | List collections |
+| GET | `/admin/collections/{name}/docs` | List sources in collection |
+| DELETE | `/admin/docs` | Delete document by source |
+| GET | `/admin/users` | List users |
+| PUT | `/admin/users/{id}/role` | Set admin flag |
+| PUT | `/admin/users/{id}/password` | Reset user password |
+| DELETE | `/admin/users/{id}` | Delete user |
 
-## Ingestion Notes
+## Retrieval Pipeline
 
-- Supported file ingest formats: `.pdf`, `.docx`
-- Hugging Face legal ingest: `POST /ingest-hf-legal`
-  - Key query params: `collection_name=legal`, `mode=default|proxy_strict`, `only_pharma_related=false|true`, `write_quarantine=false|true`, `quarantine_collection_name`, `limit`, `batch_size`, `start_offset`, `skip_summary`
-  - `mode=proxy_strict` applies proxy validity rules: legal type whitelist + latest-version dedupe by `issuance_date` (DD/MM/YYYY)
-  - `write_quarantine=true` stores rejected proxy rows into `<collection_name>_quarantine` (or your custom `quarantine_collection_name`)
-  - `skip_summary` defaults to your config (`HF_LEGAL_SKIP_SUMMARY_DEFAULT=true` recommended for fast backfill)
-- PDF parsing uses Docling markdown export.
-- Chunks are stored in Qdrant with parent/child metadata and sparse vocab side files.
-- To skip LLM summary generation during file ingest, set `skip_summary=true` in form data.
-- HF legal rows are stored with payload metadata fields like: `hf_id`, `title`, `legal_type`, `legal_sectors`, `issuing_authority`, `issuance_date`, `url`, `source_dataset`, `is_pharma_related`, `pharma_tags`.
+Each `/ask` request goes through:
 
-### HF dataset utilities
+1. **Intent classification** (`supervisor.py`) — routes to `legal`, `drug`, or both collections
+2. **Query reformulation** — rewrites follow-up questions into standalone queries using conversation history
+3. **Query expansion** — generates 3 semantic variations via LLM
+4. **Hybrid search** — for each collection:
+   - Dense: cosine similarity via pgvector (IVFFlat index)
+   - Sparse: BM25 re-scoring using stored vocab + Robertson IDF
+   - Combined score: `0.7 × dense + 0.3 × normalized_sparse`
+5. **Reranking** — CrossEncoder (`mMiniLMv2-L12-H384`) selects top 5
+6. **Parent fetch** — retrieves full parent article text for reranked child chunks
+7. **LLM generation** — answer generated from context + conversation history
 
-Run from project root (with venv activated):
+## Ingestion Pipeline
+
+Each uploaded PDF or DOCX goes through:
+
+1. **Load** — PDF via Docling (→ Markdown), DOCX via python-docx
+2. **Parse**
+   - Vietnamese legal documents: split on `Điều`/`Article`/`Section` markers (≥5 required) → one parent per article
+   - Non-legal: semantic/header-based splitting
+   - Articles exceeding 1200 tokens are further split with `RecursiveCharacterTextSplitter`
+3. **Child chunking** — each parent split on numbered clause markers (`1.`, `2.`, …); falls back to sentences
+4. **Metadata enrichment** — LLM generates `summary` and `target_question` per parent (skippable via `skip_summary=true`)
+5. **Embedding** — OpenAI `text-embedding-3-small` (or HuggingFace alternative)
+6. **Sparse vectors** — BM25 indices/values computed from corpus vocabulary
+7. **Store** — dense + sparse vectors → `vector_chunks`; parent metadata → `vector_parents`; BM25 vocab/stats stored per collection
+
+### HF Legal Dataset Ingest
+
+```bash
+POST /ingest-hf-legal?collection_name=legal&mode=proxy_strict&skip_summary=true
+```
+
+Key params:
+- `mode=proxy_strict` — whitelist filter by legal type + latest-version dedupe by `issuance_date`
+- `only_pharma_related=true` — filter to pharma-tagged documents only
+- `write_quarantine=true` — store rejected rows in `<collection_name>_quarantine`
+- `skip_summary=true` — skip LLM summary generation (recommended for bulk ingest)
+
+HF metadata fields stored: `hf_id`, `title`, `legal_type`, `legal_sectors`, `issuing_authority`, `issuance_date`, `url`, `source_dataset`, `is_pharma_related`, `pharma_tags`.
+
+### CLI ingest (legacy scripts)
 
 ```bash
 cd backend
-python hf_legal_query.py --limit 100
 python hf_legal_ingest.py --collection legal --skip-summary true --limit 500
 python hf_legal_ingest.py --collection legal --filter proxy_strict --skip-summary true --limit 500
-python hf_legal_ingest.py --collection legal --filter proxy_strict --write-quarantine true --quarantine-collection legal_quarantine --skip-summary true --limit 500
 ```
 
-`hf_legal_query.py` returns pharmaceutical-related legal metadata rows using `legal_sectors` tags.
+## Drug Data Scraper
 
-## Operational Notes
-
-- Runtime files created automatically:
-  - `uploads/`
-  - `feedback.json`
-  - `llm_usage.json`
-- Keep Docker Qdrant volume and MongoDB data persisted in production.
-- `/ask` rate limit uses JWT `sub` when available; falls back to IP.
-
-## RAGAS Evaluation
-
-The repository includes a local evaluation runner at `backend/eval/ragas_runner.py`.
-It evaluates current retrieval + generation behavior directly from Python (no HTTP server required).
-
-### Dataset
-
-- Starter curated dataset: `backend/eval/datasets/curated.jsonl`
-- Required fields per JSONL row:
-  - `question` (string)
-  - `ground_truth` (string)
-  - `collections` (array, e.g. `['legal']`, `['drug']`, `['legal','drug']`)
-- Optional fields:
-  - `id`, `metadata`
-
-### Install eval dependencies
+`backend/scripts/scrape_longchau.py` scrapes `nhathuoclongchau.com.vn` using Playwright and populates the `drug_list` and `drug_inventory` tables directly in PostgreSQL.
 
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt
+cd backend/scripts
+python scrape_longchau.py
 ```
 
-### Run evaluation (from project root)
+Supports resumable runs via `scrape_progress.json`.
+
+## RAGAS Evaluation
 
 ```bash
 source .venv/bin/activate
@@ -281,28 +325,21 @@ python -m eval.ragas_runner \
   --metrics faithfulness,answer_relevancy,context_precision,context_recall
 ```
 
-### Include synthetic expansion
+With synthetic expansion:
 
 ```bash
-source .venv/bin/activate
-cd backend
 python -m eval.ragas_runner \
   --dataset eval/datasets/curated.jsonl \
   --include-synthetic \
   --synthetic-max-per-collection 40
 ```
 
-### Outputs
+Outputs written to `eval_results/`:
+- `<run>.summary.json` — aggregate metrics + run metadata
+- `<run>.raw.json` / `<run>.raw.csv` — per-row scores
+- `<run>.pipeline_outputs.json` — question, retrieved contexts, generated answer
 
-Evaluation outputs are written to `eval_results/` (configurable via `EVAL_OUTPUT_DIR`):
-- `<run_name>.summary.json` (aggregate metrics + run metadata)
-- `<run_name>.raw.json` (per-row scored data from RAGAS)
-- `<run_name>.raw.csv` (CSV form of per-row scores)
-- `<run_name>.pipeline_outputs.json` (question, retrieved contexts, generated answer)
-
-### Environment options
-
-Optional settings in `.env`:
+Optional eval settings in `.env`:
 
 ```env
 EVAL_JUDGE_MODEL=gpt-4o-mini
@@ -312,5 +349,9 @@ EVAL_MAX_SAMPLES=0
 EVAL_OUTPUT_DIR=eval_results
 ```
 
-Notes:
-- Running evaluation may consume significant OpenAI tokens, depending on sample count.
+## Operational Notes
+
+- `/ask` rate limit uses JWT `sub` when available, falls back to IP
+- Runtime directories created automatically: `uploads/`
+- LLM token usage is tracked daily in `llm_usage_daily` and visible in the admin analytics dashboard
+- PostgreSQL data is persisted in a named Docker volume (`postgres_data`)

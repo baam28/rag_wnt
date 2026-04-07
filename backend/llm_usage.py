@@ -1,12 +1,12 @@
-"""LLM API usage tracking (MongoDB-backed)."""
+"""LLM API usage tracking (PostgreSQL-backed)."""
 
 import time
 
-from mongo_client import get_llm_usage_collection
+from pg_client import get_llm_usage_collection
 
 
 def record_usage(prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
-    """Record one LLM request usage in MongoDB."""
+    """Record one LLM request usage in PostgreSQL."""
     if prompt_tokens == 0 and completion_tokens == 0:
         return
     day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -29,9 +29,7 @@ def get_usage(days: int = 30) -> dict:
     """Return total usage and daily breakdown for the last `days` days."""
     coll = get_llm_usage_collection()
 
-    docs = list(
-        coll.find({}, {"_id": 0, "date": 1, "prompt_tokens": 1, "completion_tokens": 1, "requests": 1}).sort("date", -1).limit(max(0, int(days)))
-    )
+    docs = coll.find({})
 
     daily_list = [
         {
@@ -43,24 +41,12 @@ def get_usage(days: int = 30) -> dict:
         for d in docs
     ]
 
-    totals = list(
-        coll.aggregate([
-            {
-                "$group": {
-                    "_id": None,
-                    "prompt_tokens": {"$sum": "$prompt_tokens"},
-                    "completion_tokens": {"$sum": "$completion_tokens"},
-                    "requests": {"$sum": "$requests"},
-                }
-            }
-        ])
-    )
-
-    if totals:
+    agg = coll.aggregate([])
+    if agg:
         total = {
-            "prompt_tokens": int(totals[0].get("prompt_tokens", 0) or 0),
-            "completion_tokens": int(totals[0].get("completion_tokens", 0) or 0),
-            "requests": int(totals[0].get("requests", 0) or 0),
+            "prompt_tokens": int(agg[0].get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(agg[0].get("completion_tokens", 0) or 0),
+            "requests": int(agg[0].get("requests", 0) or 0),
         }
     else:
         total = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}

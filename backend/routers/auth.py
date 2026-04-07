@@ -15,12 +15,20 @@ from deps import (
     hash_password,
     verify_password,
     get_current_user,
-    _user_from_doc,
     _create_jwt_for_user,
 )
-from mongo_client import get_users_collection
+from pg_client import get_users_collection
 
 router = APIRouter(tags=["auth"])
+
+
+def _make_current_user(doc: dict) -> CurrentUser:
+    return CurrentUser(
+        id=str(doc["_id"]),
+        username=doc.get("username", ""),
+        email=doc.get("email", ""),
+        is_admin=bool(doc.get("is_admin", False)),
+    )
 
 
 @router.post("/auth/register", response_model=AuthResponse)
@@ -58,8 +66,8 @@ def register(req: RegisterRequest):
         "last_login_at": now,
     }
     res = users.insert_one(doc)
-    doc["_id"] = res.inserted_id
-    user = _user_from_doc(doc)
+    doc["_id"] = str(res.inserted_id)
+    user = _make_current_user(doc)
     token = _create_jwt_for_user(user)
     return AuthResponse(token=token, user=UserOut(id=user.id, username=user.username, is_admin=user.is_admin))
 
@@ -73,17 +81,17 @@ def login(req: LoginRequest):
         raise HTTPException(status_code=400, detail="Username and password are required")
 
     users = get_users_collection()
-    # Primary: login by username. Backward-compatible fallback: email login.
     doc = users.find_one({"username": login_id}) or users.find_one({"email": login_id})
     if not doc or "password_hash" not in doc:
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not verify_password(password, doc.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    # Update last_login_at
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     users.update_one({"_id": doc["_id"]}, {"$set": {"last_login_at": now}})
 
-    user = _user_from_doc(doc)
+    user = _make_current_user(doc)
     token = _create_jwt_for_user(user)
     return AuthResponse(token=token, user=UserOut(id=user.id, username=user.username, is_admin=user.is_admin))
 
@@ -98,11 +106,11 @@ def change_password(
         raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
 
     users = get_users_collection()
-    doc = users.find_one({"email": current_user.email})
+    doc = users.find_one({"_id": current_user.id})
     if not doc or "password_hash" not in doc:
         raise HTTPException(status_code=401, detail="User not found")
     if not verify_password(req.old_password, doc.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Incorrect old password")
 
-    users.update_one({"_id": doc["_id"]}, {"$set": {"password_hash": hash_password(req.new_password)}})
+    users.update_one({"_id": current_user.id}, {"$set": {"password_hash": hash_password(req.new_password)}})
     return {"message": "Password updated successfully"}

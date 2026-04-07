@@ -112,14 +112,14 @@ function LandingPage({ onLoggedIn }) {
             <button
               type="button"
               className={"landing-tab" + (mode === "login" ? " active" : "")}
-              onClick={() => { setMode("login"); setError(""); setEmail(""); }}
+              onClick={() => { setMode("login"); setError(""); setEmail(""); setUsername(""); setPassword(""); }}
             >
               Đăng nhập
             </button>
             <button
               type="button"
               className={"landing-tab" + (mode === "register" ? " active" : "")}
-              onClick={() => { setMode("register"); setError(""); setEmail(""); }}
+              onClick={() => { setMode("register"); setError(""); setEmail(""); setUsername(""); setPassword(""); }}
             >
               Đăng ký
             </button>
