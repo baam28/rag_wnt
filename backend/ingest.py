@@ -4,8 +4,6 @@ import hashlib
 import json
 import logging
 import re
-import unicodedata
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -25,7 +23,6 @@ from pg_client import (
     upsert_vector_parents,
     insert_vector_chunks,
     get_collection_count,
-    load_existing_hf_ids,
 )
 from utils import fix_position_ids as _fix_position_ids, tokenize_for_sparse as _tokenize_for_sparse
 
@@ -34,66 +31,6 @@ _ingest_logger = logging.getLogger(__name__)
 TABLE_START = "<!--TABLE_START-->"
 TABLE_END = "<!--TABLE_END-->"
 
-
-def _normalize_text_for_match(text: str) -> str:
-    """Lowercase + remove Vietnamese diacritics for robust substring matching."""
-    normalized = unicodedata.normalize("NFD", (text or "").lower())
-    stripped = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
-    return re.sub(r"\s+", " ", stripped).strip()
-
-
-def _split_sector_values(legal_sectors: str) -> list[str]:
-    raw = (legal_sectors or "").strip()
-    if not raw:
-        return []
-    return [part.strip() for part in raw.split("|") if part.strip()]
-
-
-def _extract_pharma_tags(legal_sectors: str, keywords: list[str]) -> list[str]:
-    sectors = _split_sector_values(legal_sectors)
-    if not sectors:
-        return []
-    normalized_keywords = [_normalize_text_for_match(k) for k in keywords if (k or "").strip()]
-    tags: list[str] = []
-    for sector in sectors:
-        normalized_sector = _normalize_text_for_match(sector)
-        if any(k and (k in normalized_sector or normalized_sector in k) for k in normalized_keywords):
-            tags.append(sector)
-    return tags
-
-
-def _parse_proxy_issuance_date(date_text: str, date_format: str) -> datetime | None:
-    raw = (date_text or "").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.strptime(raw, date_format)
-    except ValueError:
-        return None
-
-
-def _proxy_group_key(meta: dict[str, Any]) -> str:
-    document_number = str(meta.get("document_number") or "").strip()
-    legal_type = _normalize_text_for_match(str(meta.get("legal_type") or ""))
-    if document_number:
-        return f"num::{legal_type}::{_normalize_text_for_match(document_number)}"
-    title = _normalize_text_for_match(str(meta.get("title") or ""))
-    return f"title::{legal_type}::{title}"
-
-
-def _proxy_rank_tuple(
-    *,
-    is_vbhn: bool,
-    issuance_date: datetime,
-    has_issuing_authority: bool,
-    has_url: bool,
-) -> tuple[int, int, int, int]:
-    return (
-        1 if is_vbhn else 0,
-        issuance_date.toordinal(),
-        1 if has_issuing_authority else 0,
-        1 if has_url else 0,
-    )
 
 
 def _sanitize_metadata_value(value: Any) -> Any:
@@ -120,13 +57,6 @@ def _sanitize_text_for_api(text: str) -> str:
         if (ch in "\n\r\t") or (unicodedata.category(ch) not in {"Cc", "Cs"})
     )
 
-
-def _load_existing_hf_ids(collection_name: str) -> set[str]:
-    """Load existing hf_id values from PostgreSQL to support resumable ingestion."""
-    try:
-        return load_existing_hf_ids(collection_name)
-    except Exception:
-        return set()
 
 
 # --- Sparse vector helpers (for Qdrant native sparse) ---
@@ -880,8 +810,7 @@ def ingest_documents(
 
         children = parent_to_children_dynamic(parent, settings, effective_strategy=effective_strategy)
         for child in children:
-            # Preserve all parent metadata (including HF metadata like hf_id, title, legal_sectors, etc.)
-            # then add chunking-specific metadata
+            # Preserve all parent metadata then add chunking-specific metadata
             for key, value in parent.metadata.items():
                 if key not in child.metadata or key == "source":
                     child.metadata[key] = value
@@ -952,7 +881,6 @@ def ingest_documents(
             "sparse_indices": indices,
             "sparse_values": values,
             "payload": {**child_metadatas[i], "text": child_texts[i]},
-            "hf_id": child_metadatas[i].get("hf_id"),
         })
 
     progress("pgvector", f"Writing {len(records)} chunks to PostgreSQL...", 0, 1)
@@ -1000,342 +928,6 @@ def ingest_file(
         skip_summary=skip_summary,
     )
 
-
-def ingest_hf_legal_dataset(
-    *,
-    collection_name: str,
-    dataset_repo: str | None = None,
-    metadata_config: str | None = None,
-    content_config: str | None = None,
-    split: str | None = None,
-    only_pharma_related: bool = False,
-    row_filter: Optional[Callable[[dict], bool]] = None,
-    mode: str = "default",
-    write_quarantine: bool = False,
-    quarantine_collection_name: str | None = None,
-    limit: int | None = None,
-    start_offset: int = 0,
-    batch_size: int | None = None,
-    skip_summary: bool | None = None,
-    on_progress: Optional[Callable[[str, str, int, int], None]] = None,
-) -> dict[str, Any]:
-    """Ingest legal documents from Hugging Face dataset with metadata payload preservation."""
-    progress = on_progress or _noop_progress
-    settings = get_settings()
-    mode_normalized = (mode or "default").strip().lower()
-    if mode_normalized not in {"default", "proxy_strict"}:
-        raise ValueError("mode must be one of: default, proxy_strict")
-    use_proxy_mode = mode_normalized == "proxy_strict"
-
-    repo_id = dataset_repo or settings.hf_legal_dataset_repo
-    metadata_name = metadata_config or settings.hf_legal_metadata_config
-    content_name = content_config or settings.hf_legal_content_config
-    split_name = split or settings.hf_legal_split
-    batch_size = max(1, int(batch_size or settings.hf_legal_batch_size))
-    skip_summary_effective = settings.hf_legal_skip_summary_default if skip_summary is None else bool(skip_summary)
-    collection_name = sanitize_collection_name(collection_name)
-    quarantine_collection_effective = ""
-    if write_quarantine:
-        quarantine_collection_effective = sanitize_collection_name(
-            quarantine_collection_name or f"{collection_name}_quarantine"
-        )
-
-    existing_hf_ids = _load_existing_hf_ids(collection_name)
-    if existing_hf_ids:
-        progress("dataset", f"Found {len(existing_hf_ids)} existing hf_id entries; resume mode enabled", 0, 1)
-
-    try:
-        from datasets import load_dataset
-    except ImportError as e:
-        raise ImportError("datasets package is required for Hugging Face ingestion. Install with pip install datasets") from e
-
-    progress("dataset", f"Loading metadata split '{metadata_name}/{split_name}'...", 0, 1)
-    metadata_rows = load_dataset(repo_id, metadata_name, split=split_name)
-    progress("dataset", "Building metadata index...", 0, len(metadata_rows) if hasattr(metadata_rows, "__len__") else 1)
-
-    metadata_by_id: dict[str, dict[str, Any]] = {}
-    pharma_keywords = settings.hf_pharma_sector_keywords
-    for idx, row in enumerate(metadata_rows):
-        if idx < max(0, start_offset):
-            continue
-        doc_id = str(row.get("id", "")).strip()
-        if not doc_id:
-            continue
-        legal_sectors = str(row.get("legal_sectors") or "")
-        pharma_tags = _extract_pharma_tags(legal_sectors, pharma_keywords)
-        metadata_by_id[doc_id] = {
-            "hf_id": doc_id,
-            "document_number": str(row.get("document_number") or ""),
-            "title": str(row.get("title") or ""),
-            "url": str(row.get("url") or ""),
-            "legal_type": str(row.get("legal_type") or ""),
-            "legal_sectors": legal_sectors,
-            "issuing_authority": str(row.get("issuing_authority") or ""),
-            "issuance_date": str(row.get("issuance_date") or ""),
-            "signers": str(row.get("signers") or ""),
-            "source_dataset": repo_id,
-            "is_pharma_related": bool(pharma_tags),
-            "pharma_tags": "|".join(pharma_tags),
-            "source": str(row.get("title") or row.get("document_number") or f"hf_doc_{doc_id}"),
-            "file_path": f"hf://{repo_id}/{doc_id}",
-        }
-        if idx % 5000 == 0 and idx > 0:
-            progress("dataset", f"Indexed metadata rows: {idx}", idx, len(metadata_rows) if hasattr(metadata_rows, "__len__") else idx)
-
-    proxy_selected_doc_ids: set[str] = set()
-    proxy_reject_reason_by_doc_id: dict[str, str] = {}
-    rejected_legal_type = 0
-    rejected_bad_date = 0
-    rejected_older_version = 0
-
-    if use_proxy_mode:
-        valid_legal_types = {
-            _normalize_text_for_match(legal_type)
-            for legal_type in settings.hf_proxy_legal_type_whitelist
-            if (legal_type or "").strip()
-        }
-        vbhn_label = _normalize_text_for_match("Văn bản hợp nhất")
-        best_by_group: dict[str, tuple[str, tuple[int, int, int, int]]] = {}
-        candidate_doc_ids: list[str] = []
-
-        for doc_id, meta in metadata_by_id.items():
-            legal_type_normalized = _normalize_text_for_match(str(meta.get("legal_type") or ""))
-            if legal_type_normalized not in valid_legal_types:
-                proxy_reject_reason_by_doc_id[doc_id] = "rejected_legal_type"
-                continue
-
-            if row_filter is not None and not row_filter(meta):
-                proxy_reject_reason_by_doc_id[doc_id] = "skipped_non_pharma"
-                continue
-            if row_filter is None and only_pharma_related and not meta.get("is_pharma_related"):
-                proxy_reject_reason_by_doc_id[doc_id] = "skipped_non_pharma"
-                continue
-
-            issuance_date = _parse_proxy_issuance_date(str(meta.get("issuance_date") or ""), settings.hf_proxy_date_format)
-            if issuance_date is None:
-                proxy_reject_reason_by_doc_id[doc_id] = "rejected_bad_date"
-                continue
-
-            candidate_doc_ids.append(doc_id)
-            group_key = _proxy_group_key(meta)
-            rank = _proxy_rank_tuple(
-                is_vbhn=(settings.hf_proxy_prefer_vbhn and legal_type_normalized == vbhn_label),
-                issuance_date=issuance_date,
-                has_issuing_authority=bool(str(meta.get("issuing_authority") or "").strip()),
-                has_url=bool(str(meta.get("url") or "").strip()),
-            )
-            current = best_by_group.get(group_key)
-            if current is None or rank > current[1]:
-                best_by_group[group_key] = (doc_id, rank)
-
-        proxy_selected_doc_ids = {doc_id for doc_id, _ in best_by_group.values()}
-        for doc_id in candidate_doc_ids:
-            if doc_id in proxy_selected_doc_ids:
-                proxy_reject_reason_by_doc_id[doc_id] = "selected"
-            else:
-                proxy_reject_reason_by_doc_id[doc_id] = "rejected_older_version"
-
-    progress("dataset", f"Loading content split '{content_name}/{split_name}'...", 0, 1)
-    content_rows = load_dataset(repo_id, content_name, split=split_name)
-
-    ingested_docs = 0
-    skipped_no_metadata = 0
-    skipped_empty_content = 0
-    skipped_non_pharma = 0
-    total_parents = 0
-    total_children = 0
-    total_chunks_in_db = 0
-    batches_processed = 0
-    docs_batch: list[Document] = []
-    quarantine_ingested_docs = 0
-    quarantine_batches_processed = 0
-    quarantine_num_parents = 0
-    quarantine_num_children = 0
-    quarantine_total_chunks_in_db = 0
-    quarantine_docs_batch: list[Document] = []
-
-    for idx, row in enumerate(content_rows):
-        if idx < max(0, start_offset):
-            continue
-
-        doc_id = str(row.get("id", "")).strip()
-        if not doc_id:
-            continue
-        if doc_id in existing_hf_ids:
-            continue
-        meta = metadata_by_id.get(doc_id)
-        if not meta:
-            skipped_no_metadata += 1
-            continue
-
-        if use_proxy_mode:
-            reason = proxy_reject_reason_by_doc_id.get(doc_id)
-            if reason is None:
-                reason = "rejected_legal_type"
-            if reason != "selected":
-                if reason == "skipped_non_pharma":
-                    skipped_non_pharma += 1
-                elif reason == "rejected_bad_date":
-                    rejected_bad_date += 1
-                elif reason == "rejected_older_version":
-                    rejected_older_version += 1
-                elif reason == "rejected_legal_type":
-                    rejected_legal_type += 1
-                else:
-                    skipped_non_pharma += 1
-
-                if quarantine_collection_effective:
-                    rejected_content = str(row.get("content") or "").strip()
-                    if rejected_content:
-                        rejected_meta = {
-                            **meta,
-                            "validity_mode": "proxy",
-                            "validity_confidence": "low",
-                            "is_latest_in_group": False,
-                            "proxy_reject_reason": reason,
-                        }
-                        quarantine_docs_batch.append(
-                            Document(page_content=rejected_content, metadata=rejected_meta)
-                        )
-                        quarantine_ingested_docs += 1
-
-                        if len(quarantine_docs_batch) >= batch_size:
-                            quarantine_batches_processed += 1
-                            progress(
-                                "dataset",
-                                f"Ingesting HF quarantine batch {quarantine_batches_processed} ({len(quarantine_docs_batch)} docs)...",
-                                quarantine_ingested_docs,
-                                quarantine_ingested_docs,
-                            )
-                            quarantine_result = ingest_documents(
-                                quarantine_docs_batch,
-                                source_label=f"{repo_id}:{split_name}:quarantine_batch_{quarantine_batches_processed}",
-                                collection_name=quarantine_collection_effective,
-                                skip_summary=skip_summary_effective,
-                            )
-                            if "error" in quarantine_result:
-                                return quarantine_result
-                            quarantine_num_parents += int(quarantine_result.get("num_parents", 0))
-                            quarantine_num_children += int(quarantine_result.get("num_children", 0))
-                            quarantine_total_chunks_in_db = int(
-                                quarantine_result.get("total_chunks_in_db", quarantine_total_chunks_in_db)
-                            )
-                            quarantine_docs_batch = []
-                continue
-        else:
-            if row_filter is not None:
-                if not row_filter(meta):
-                    skipped_non_pharma += 1
-                    continue
-            elif only_pharma_related and not meta.get("is_pharma_related"):
-                skipped_non_pharma += 1
-                continue
-
-        content = str(row.get("content") or "").strip()
-        if not content:
-            skipped_empty_content += 1
-            continue
-
-        if use_proxy_mode:
-            legal_type_normalized = _normalize_text_for_match(str(meta.get("legal_type") or ""))
-            confidence = "medium" if legal_type_normalized == _normalize_text_for_match("Văn bản hợp nhất") else "low"
-            meta = {
-                **meta,
-                "validity_mode": "proxy",
-                "validity_confidence": confidence,
-                "is_latest_in_group": True,
-            }
-
-        docs_batch.append(Document(page_content=content, metadata=dict(meta)))
-        ingested_docs += 1
-
-        if limit and ingested_docs >= limit:
-            should_flush = True
-        else:
-            should_flush = len(docs_batch) >= batch_size
-
-        if should_flush and docs_batch:
-            batches_processed += 1
-            progress("dataset", f"Ingesting HF batch {batches_processed} ({len(docs_batch)} docs)...", ingested_docs, limit or ingested_docs)
-            result = ingest_documents(
-                docs_batch,
-                source_label=f"{repo_id}:{split_name}:batch_{batches_processed}",
-                collection_name=collection_name,
-                skip_summary=skip_summary_effective,
-            )
-            if "error" in result:
-                return result
-            total_parents += int(result.get("num_parents", 0))
-            total_children += int(result.get("num_children", 0))
-            total_chunks_in_db = int(result.get("total_chunks_in_db", total_chunks_in_db))
-            docs_batch = []
-
-        if limit and ingested_docs >= limit:
-            break
-
-    if docs_batch:
-        batches_processed += 1
-        progress("dataset", f"Ingesting final HF batch {batches_processed} ({len(docs_batch)} docs)...", ingested_docs, limit or ingested_docs)
-        result = ingest_documents(
-            docs_batch,
-            source_label=f"{repo_id}:{split_name}:batch_{batches_processed}",
-            collection_name=collection_name,
-            skip_summary=skip_summary_effective,
-        )
-        if "error" in result:
-            return result
-        total_parents += int(result.get("num_parents", 0))
-        total_children += int(result.get("num_children", 0))
-        total_chunks_in_db = int(result.get("total_chunks_in_db", total_chunks_in_db))
-
-    if quarantine_docs_batch:
-        quarantine_batches_processed += 1
-        progress(
-            "dataset",
-            f"Ingesting final HF quarantine batch {quarantine_batches_processed} ({len(quarantine_docs_batch)} docs)...",
-            quarantine_ingested_docs,
-            quarantine_ingested_docs,
-        )
-        quarantine_result = ingest_documents(
-            quarantine_docs_batch,
-            source_label=f"{repo_id}:{split_name}:quarantine_batch_{quarantine_batches_processed}",
-            collection_name=quarantine_collection_effective,
-            skip_summary=skip_summary_effective,
-        )
-        if "error" in quarantine_result:
-            return quarantine_result
-        quarantine_num_parents += int(quarantine_result.get("num_parents", 0))
-        quarantine_num_children += int(quarantine_result.get("num_children", 0))
-        quarantine_total_chunks_in_db = int(
-            quarantine_result.get("total_chunks_in_db", quarantine_total_chunks_in_db)
-        )
-
-    progress("done", f"HF ingest complete: {ingested_docs} docs", ingested_docs, limit or ingested_docs)
-    return {
-        "dataset": repo_id,
-        "mode": mode_normalized,
-        "write_quarantine": bool(quarantine_collection_effective),
-        "quarantine_collection_name": quarantine_collection_effective or None,
-        "collection_name": collection_name,
-        "ingested_docs": ingested_docs,
-        "batches_processed": batches_processed,
-        "num_parents": total_parents,
-        "num_children": total_children,
-        "total_chunks_in_db": total_chunks_in_db,
-        "skip_summary": skip_summary_effective,
-        "only_pharma_related": only_pharma_related,
-        "skipped_no_metadata": skipped_no_metadata,
-        "skipped_empty_content": skipped_empty_content,
-        "skipped_non_pharma": skipped_non_pharma,
-        "rejected_legal_type": rejected_legal_type,
-        "rejected_bad_date": rejected_bad_date,
-        "rejected_older_version": rejected_older_version,
-        "quarantine_ingested_docs": quarantine_ingested_docs,
-        "quarantine_batches_processed": quarantine_batches_processed,
-        "quarantine_num_parents": quarantine_num_parents,
-        "quarantine_num_children": quarantine_num_children,
-        "quarantine_total_chunks_in_db": quarantine_total_chunks_in_db,
-    }
 
 
 def ingest_directory(

@@ -721,7 +721,7 @@ def insert_vector_chunks(
     Each record must have:
         parent_id, chunk_index, text, embedding (list[float]),
         sparse_indices (list[int]), sparse_values (list[float]),
-        payload (dict), hf_id (str|None)
+        payload (dict)
     """
     if not records:
         return
@@ -739,8 +739,8 @@ def insert_vector_chunks(
                 cur.execute(
                     """INSERT INTO vector_chunks
                        (collection_name, parent_id, chunk_index, text,
-                        embedding, sparse_indices, sparse_values, payload, hf_id)
-                       VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s)""",
+                        embedding, sparse_indices, sparse_values, payload)
+                       VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s)""",
                     (
                         collection_name,
                         rec["parent_id"],
@@ -750,7 +750,6 @@ def insert_vector_chunks(
                         rec.get("sparse_indices") or [],
                         rec.get("sparse_values") or [],
                         json.dumps(rec.get("payload", {})),
-                        rec.get("hf_id"),
                     ),
                 )
 
@@ -800,15 +799,6 @@ def similarity_search(
         (emb_str, collection_name, emb_str, top_k),
     )
     return rows
-
-
-def load_existing_hf_ids(collection_name: str) -> set[str]:
-    """Return set of hf_id values already ingested for dedup."""
-    rows = _q(
-        "SELECT hf_id FROM vector_chunks WHERE collection_name = %s AND hf_id IS NOT NULL",
-        (collection_name,),
-    )
-    return {str(r["hf_id"]) for r in rows if r.get("hf_id")}
 
 
 def list_collections() -> list[str]:

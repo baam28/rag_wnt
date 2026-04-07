@@ -234,7 +234,6 @@ Access:
 | Method | Path | Description |
 |---|---|---|
 | POST | `/ingest-file` | Upload PDF/DOCX (`?async=true` for background job) |
-| POST | `/ingest-hf-legal` | Ingest from Hugging Face legal dataset (async by default) |
 | GET | `/ingest-jobs/{job_id}` | Poll async job status |
 | POST | `/ingest-jobs/{job_id}/cancel` | Cancel async job |
 
@@ -278,31 +277,9 @@ Each uploaded PDF or DOCX goes through:
    - Articles exceeding 1200 tokens are further split with `RecursiveCharacterTextSplitter`
 3. **Child chunking** — each parent split on numbered clause markers (`1.`, `2.`, …); falls back to sentences
 4. **Metadata enrichment** — LLM generates `summary` and `target_question` per parent (skippable via `skip_summary=true`)
-5. **Embedding** — OpenAI `text-embedding-3-small` (or HuggingFace alternative)
+5. **Embedding** — OpenAI `text-embedding-3-small`
 6. **Sparse vectors** — BM25 indices/values computed from corpus vocabulary
 7. **Store** — dense + sparse vectors → `vector_chunks`; parent metadata → `vector_parents`; BM25 vocab/stats stored per collection
-
-### HF Legal Dataset Ingest
-
-```bash
-POST /ingest-hf-legal?collection_name=legal&mode=proxy_strict&skip_summary=true
-```
-
-Key params:
-- `mode=proxy_strict` — whitelist filter by legal type + latest-version dedupe by `issuance_date`
-- `only_pharma_related=true` — filter to pharma-tagged documents only
-- `write_quarantine=true` — store rejected rows in `<collection_name>_quarantine`
-- `skip_summary=true` — skip LLM summary generation (recommended for bulk ingest)
-
-HF metadata fields stored: `hf_id`, `title`, `legal_type`, `legal_sectors`, `issuing_authority`, `issuance_date`, `url`, `source_dataset`, `is_pharma_related`, `pharma_tags`.
-
-### CLI ingest (legacy scripts)
-
-```bash
-cd backend
-python hf_legal_ingest.py --collection legal --skip-summary true --limit 500
-python hf_legal_ingest.py --collection legal --filter proxy_strict --skip-summary true --limit 500
-```
 
 ## Drug Data Scraper
 

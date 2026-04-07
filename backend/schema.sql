@@ -139,12 +139,10 @@ CREATE TABLE IF NOT EXISTS vector_chunks (
     sparse_indices  INTEGER[],           -- BM25 sparse vector indices
     sparse_values   DOUBLE PRECISION[],  -- BM25 sparse vector values
     payload         JSONB NOT NULL DEFAULT '{}',  -- all chunk metadata
-    hf_id           TEXT,               -- Hugging Face document ID for dedup
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_coll ON vector_chunks(collection_name);
 CREATE INDEX IF NOT EXISTS idx_chunks_parent ON vector_chunks(collection_name, parent_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_hf_id ON vector_chunks(collection_name, hf_id) WHERE hf_id IS NOT NULL;
 
 -- The vector index is created AFTER first documents are ingested since we need to know the dimension.
 -- Run manually after ingest:

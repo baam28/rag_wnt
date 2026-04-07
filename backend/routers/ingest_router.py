@@ -4,14 +4,14 @@ import asyncio
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 
 from config import get_settings
 from deps import IngestResponse, IngestJobStatusResponse
-from ingest import ingest_file, ingest_hf_legal_dataset
+from ingest import ingest_file
 
 router = APIRouter(tags=["ingest"])
 
@@ -147,58 +147,6 @@ def _run_ingest_job(job_id: str, target_paths: list[Path], collection_name: str,
         _set_job(job_id, {"status": "error", "error": str(e)})
 
 
-def _run_hf_ingest_job(
-    job_id: str,
-    collection_name: str,
-    only_pharma_related: bool,
-    mode: Literal["default", "proxy_strict"],
-    write_quarantine: bool,
-    quarantine_collection_name: str | None,
-    limit: int | None,
-    start_offset: int,
-    batch_size: int | None,
-    skip_summary: bool | None,
-) -> None:
-    """Run Hugging Face legal dataset ingestion in background and update job state."""
-    _set_job(job_id, {"status": "running", "phase": "start", "message": "Đang bắt đầu ingest dữ liệu Hugging Face...", "current": 0, "total": 1})
-
-    def progress_cb(step: str, msg: str, current: int, total: int) -> None:
-        job = _get_job(job_id)
-        if job and job.get("cancelled"):
-            raise IngestCancelled()
-        _set_job(job_id, {"phase": step, "message": msg, "current": current, "total": total or 1})
-
-    try:
-        result = ingest_hf_legal_dataset(
-            collection_name=collection_name,
-            only_pharma_related=only_pharma_related,
-            mode=mode,
-            write_quarantine=write_quarantine,
-            quarantine_collection_name=quarantine_collection_name,
-            limit=limit,
-            start_offset=start_offset,
-            batch_size=batch_size,
-            skip_summary=skip_summary,
-            on_progress=progress_cb,
-        )
-        if "error" in result:
-            _set_job(job_id, {"status": "error", "error": result["error"]})
-            return
-        _set_job(
-            job_id,
-            {
-                "status": "done",
-                "phase": "done",
-                "message": "Hoàn thành",
-                "result": result,
-            },
-        )
-    except IngestCancelled:
-        _set_job(job_id, {"status": "cancelled", "error": "Cancelled by user"})
-    except Exception as e:
-        _set_job(job_id, {"status": "error", "error": str(e)})
-
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -270,74 +218,6 @@ async def ingest_file_endpoint(
             num_children=single.get("num_children", 0),
             total_chunks_in_db=single.get("total_chunks_in_db", 0),
         )
-    return result
-
-
-@router.post("/ingest-hf-legal")
-async def ingest_hf_legal_endpoint(
-    collection_name: str = Query("legal"),
-    only_pharma_related: bool = Query(False),
-    mode: Literal["default", "proxy_strict"] = Query("default"),
-    write_quarantine: bool = Query(False),
-    quarantine_collection_name: str | None = Query(None),
-    limit: int | None = Query(None, ge=1),
-    start_offset: int = Query(0, ge=0),
-    batch_size: int | None = Query(None, ge=1),
-    skip_summary: bool | None = Query(None),
-    async_mode: bool = Query(True, alias="async"),
-):
-    """Ingest legal docs from Hugging Face dataset into vector store.
-
-    Default behavior uses settings.hf_legal_skip_summary_default (recommended: true for speed).
-    """
-    if async_mode:
-        job_id = str(uuid.uuid4())
-        _set_job(job_id, {
-            "status": "pending",
-            "phase": "pending",
-            "message": "Đang xếp hàng ingest Hugging Face...",
-            "current": 0,
-            "total": 1,
-        })
-        threading.Thread(
-            target=_run_hf_ingest_job,
-            args=(
-                job_id,
-                collection_name,
-                only_pharma_related,
-                mode,
-                write_quarantine,
-                quarantine_collection_name,
-                limit,
-                start_offset,
-                batch_size,
-                skip_summary,
-            ),
-            daemon=True,
-        ).start()
-        return JSONResponse(content={"job_id": job_id}, status_code=202)
-
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: ingest_hf_legal_dataset(
-                collection_name=collection_name,
-                only_pharma_related=only_pharma_related,
-                mode=mode,
-                write_quarantine=write_quarantine,
-                quarantine_collection_name=quarantine_collection_name,
-                limit=limit,
-                start_offset=start_offset,
-                batch_size=batch_size,
-                skip_summary=skip_summary,
-            ),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
     return result
 
 

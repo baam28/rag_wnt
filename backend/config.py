@@ -57,41 +57,6 @@ class Settings(BaseSettings):
     legal_collection_name: str = "legal"
     drug_collection_name: str = "drug"
 
-    # Hugging Face legal dataset ingestion
-    hf_legal_dataset_repo: str = "th1nhng0/vietnamese-legal-documents"
-    hf_legal_metadata_config: str = "metadata"
-    hf_legal_content_config: str = "content"
-    hf_legal_split: str = "data"
-    hf_legal_batch_size: int = 25
-    hf_legal_skip_summary_default: bool = True
-    hf_proxy_legal_type_whitelist: list[str] = [
-        "Luật",
-        "Nghị định",
-        "Thông tư",
-        "Văn bản hợp nhất",
-    ]
-    hf_proxy_prefer_vbhn: bool = True
-    hf_proxy_date_format: str = "%d/%m/%Y"
-    hf_pharma_sector_keywords: list[str] = [
-        "y tế",
-        "dược",
-        "thuốc",
-        "dược phẩm",
-        "dược liệu",
-        "vắc xin",
-        "vaccine",
-        "sinh phẩm",
-        "dược lâm sàng",
-        "nhà thuốc",
-        "quầy thuốc",
-        "kê đơn",
-        "gmp",
-        "gpp",
-        "gdp",
-        "bệnh",
-        "bệnh viện",
-    ]
-
     # PostgreSQL database (replaces MongoDB + Qdrant)
     database_url: str = "postgresql://admin:password@localhost:5433/pharmanet"
 
