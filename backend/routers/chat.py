@@ -234,9 +234,8 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         record_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0))
         sources = [
             {
+                "source": c.get("source", "Unknown"),
                 "rank": c.get("rank"),
-                "source": c.get("source"),
-                "summary": c.get("summary", "")[:200],
                 "content": c.get("content", "")[:1000],
                 "collection_name": c.get("collection_name"),
                 "page": c.get("page"),
@@ -244,7 +243,7 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             for c in final_contexts
         ]
 
-        # 5. Persist to Mongo
+        # 5. Persist to Postgres
         sessions_coll = get_chat_sessions_collection()
         msgs_coll = get_chat_messages_collection()
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

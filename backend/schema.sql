@@ -97,8 +97,6 @@ CREATE TABLE IF NOT EXISTS vector_parents (
     collection_name TEXT NOT NULL,
     parent_id       TEXT NOT NULL,
     content         TEXT,
-    summary         TEXT,
-    target_question TEXT,
     source          TEXT,
     document_year   INTEGER,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),

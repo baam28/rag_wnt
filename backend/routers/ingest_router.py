@@ -62,7 +62,6 @@ def _save_uploaded_files(files: list[UploadFile], upload_dir: Path) -> list[Path
 def _ingest_files_batch(
     target_paths: list[Path],
     collection_name: str,
-    skip_summary: bool,
     progress_cb: Any | None = None,
 ) -> dict[str, Any]:
     files_out: list[dict[str, Any]] = []
@@ -83,7 +82,6 @@ def _ingest_files_batch(
         result = ingest_file(
             target_path,
             collection_name=collection_name,
-            skip_summary=skip_summary,
         )
         if "error" in result:
             return {"error": f"{target_path.name}: {result['error']}"}
@@ -112,7 +110,7 @@ def _ingest_files_batch(
     }
 
 
-def _run_ingest_job(job_id: str, target_paths: list[Path], collection_name: str, skip_summary: bool = False) -> None:
+def _run_ingest_job(job_id: str, target_paths: list[Path], collection_name: str) -> None:
     """Run ingest_file for one or many files in a background thread and update job state for polling."""
     _set_job(job_id, {"status": "running", "phase": "start", "message": "Đang bắt đầu...", "current": 0, "total": 1})
 
@@ -126,7 +124,6 @@ def _run_ingest_job(job_id: str, target_paths: list[Path], collection_name: str,
         result = _ingest_files_batch(
             target_paths=target_paths,
             collection_name=collection_name,
-            skip_summary=skip_summary,
             progress_cb=progress_cb,
         )
         if "error" in result:
@@ -155,7 +152,6 @@ def _run_ingest_job(job_id: str, target_paths: list[Path], collection_name: str,
 async def ingest_file_endpoint(
     files: list[UploadFile] = File(..., alias="file"),
     collection_name: str = Form("rag_chatbot"),
-    skip_summary: str = Form("false"),
     async_mode: bool = Query(False, alias="async"),
 ):
     """Ingest one or many uploaded files into the vector store.
@@ -173,7 +169,6 @@ async def ingest_file_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
-    skip = skip_summary.strip().lower() in ("true", "1", "yes")
     total_files = len(target_paths)
 
     if async_mode:
@@ -188,7 +183,6 @@ async def ingest_file_endpoint(
         threading.Thread(
             target=_run_ingest_job,
             args=(job_id, target_paths, collection_name),
-            kwargs={"skip_summary": skip},
             daemon=True,
         ).start()
         return JSONResponse(content={"job_id": job_id}, status_code=202)
@@ -200,7 +194,6 @@ async def ingest_file_endpoint(
             lambda: _ingest_files_batch(
                 target_paths=target_paths,
                 collection_name=collection_name,
-                skip_summary=skip,
             ),
         )
     except Exception as e:

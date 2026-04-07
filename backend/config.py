@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     legal_collection_name: str = "legal"
     drug_collection_name: str = "drug"
 
-    # PostgreSQL database (replaces MongoDB + Qdrant)
+    # PostgreSQL database
     database_url: str = "postgresql://admin:password@localhost:5433/pharmanet"
 
     # Auth

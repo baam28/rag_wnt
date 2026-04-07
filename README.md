@@ -13,7 +13,7 @@ A full-stack RAG chatbot for Vietnamese pharmacy workflows:
 - **Database**: PostgreSQL 16 + pgvector (vector similarity) + pg_trgm (fuzzy search)
 - **LLM / Embeddings**: OpenAI (`gpt-4o-mini`, `text-embedding-3-small` by default)
 - **Retrieval**: Hybrid dense (pgvector) + sparse (BM25), reranked with CrossEncoder
-- **Ingestion**: PDF (Docling), DOCX (python-docx), Hugging Face datasets
+- **Ingestion**: PDF (Docling), DOCX (python-docx)
 - **Frontend**: React 18 + Vite (SPA served from `frontend/dist`)
 
 ## Architecture
@@ -40,7 +40,7 @@ A full-stack RAG chatbot for Vietnamese pharmacy workflows:
 │  · Store — PostgreSQL (dense + sparse vectors + metadata)  │
 ├────────────────────────────────────────────────────────────┤
 │  LLM: OpenAI GPT-4o-mini                                   │
-│  · Query expansion · Reformulation · Summaries             │
+│  · Query expansion · Reformulation                         │
 └──────────────────────────┬─────────────────────────────────┘
                            │
 ┌──────────────────────────▼─────────────────────────────────┐
@@ -74,7 +74,7 @@ rag_wnt/
 │   ├── routers/
 │   │   ├── auth.py             # Register · Login · Change password
 │   │   ├── chat.py             # /ask · sessions · messages
-│   │   ├── ingest_router.py    # File upload · HF legal dataset · async jobs
+│   │   ├── ingest_router.py    # File upload · async jobs
 │   │   └── admin.py            # Collections · docs · users · analytics · feedback
 │   ├── scripts/
 │   │   └── scrape_longchau.py  # Playwright scraper → drug_list / drug_inventory
@@ -106,7 +106,7 @@ All tables are defined in `backend/schema.sql` and applied automatically on firs
 | `chat_sessions` | Chat sessions per user |
 | `chat_messages` | Messages with role, content, sources (JSONB), feedback |
 | `vector_chunks` | Child chunks: dense embedding + sparse BM25 indices/values + payload (JSONB) |
-| `vector_parents` | Parent chunk metadata: content, summary, target_question, source |
+| `vector_parents` | Parent chunk metadata: content, target_question, source |
 | `vector_sparse_vocab` | BM25 vocabulary: token → index per collection |
 | `vector_bm25_stats` | BM25 stats: avgdl + idf_map (JSONB) per collection |
 | `drug_list` | Drug catalog: name, active ingredient, dosage form, therapeutic class |
@@ -142,13 +142,6 @@ DATABASE_URL=postgresql://admin:password@localhost:5433/pharmanet
 LEGAL_COLLECTION_NAME=legal
 DRUG_COLLECTION_NAME=drug
 
-# Optional: Hugging Face legal dataset
-HF_LEGAL_DATASET_REPO=th1nhng0/vietnamese-legal-documents
-HF_LEGAL_METADATA_CONFIG=metadata
-HF_LEGAL_CONTENT_CONFIG=content
-HF_LEGAL_SPLIT=data
-HF_LEGAL_BATCH_SIZE=25
-HF_LEGAL_SKIP_SUMMARY_DEFAULT=true
 
 # Optional: auto-admin at registration (JSON array)
 ADMIN_EMAILS=["admin@example.com"]
@@ -276,7 +269,7 @@ Each uploaded PDF or DOCX goes through:
    - Non-legal: semantic/header-based splitting
    - Articles exceeding 1200 tokens are further split with `RecursiveCharacterTextSplitter`
 3. **Child chunking** — each parent split on numbered clause markers (`1.`, `2.`, …); falls back to sentences
-4. **Metadata enrichment** — LLM generates `summary` and `target_question` per parent (skippable via `skip_summary=true`)
+4. **Metadata enrichment** — LLM generates `target_question` per parent
 5. **Embedding** — OpenAI `text-embedding-3-small`
 6. **Sparse vectors** — BM25 indices/values computed from corpus vocabulary
 7. **Store** — dense + sparse vectors → `vector_chunks`; parent metadata → `vector_parents`; BM25 vocab/stats stored per collection

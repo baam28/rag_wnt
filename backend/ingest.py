@@ -1,8 +1,7 @@
-"""Ingestion: load PDF/DOCX, semantic chunking, parent-child hierarchy, metadata (summary, target_question)."""
+"""Ingestion: load PDF/DOCX, semantic chunking, parent-child hierarchy."""
 import base64
 import hashlib
 import json
-import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -12,7 +11,7 @@ import tiktoken
 from docling.document_converter import DocumentConverter 
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from config import get_settings
 from legal_tokenizer import legal_tokenize as _legal_tokenize
@@ -26,7 +25,6 @@ from pg_client import (
 )
 from utils import fix_position_ids as _fix_position_ids, tokenize_for_sparse as _tokenize_for_sparse
 
-_ingest_logger = logging.getLogger(__name__)
 
 TABLE_START = "<!--TABLE_START-->"
 TABLE_END = "<!--TABLE_END-->"
@@ -583,42 +581,6 @@ def parent_to_children_dynamic(parent: Document, settings, *, effective_strategy
     return children
 
 
-def add_parent_metadata(parent: Document, llm: ChatOpenAI) -> tuple[str, str]:
-    """Generate summary and target_question for a parent chunk via LLM."""
-    prompt = """Bạn là trợ lý tóm tắt. Cho đoạn văn sau (có thể bằng tiếng Việt hoặc tiếng Anh), hãy:
-1. Tóm tắt ngắn gọn nội dung chính (2-3 câu) bằng cùng ngôn ngữ với tài liệu.
-2. Viết một câu hỏi mẫu mà đoạn văn này có thể trả lời (target question).
-
-Đoạn văn:
----
-{text}
----
-
-Trả lời theo đúng format sau (giữ nguyên nhãn):
-SUMMARY: <tóm tắt>
-TARGET_QUESTION: <câu hỏi mẫu>"""
-    msg = prompt.format(text=parent.page_content[:4000])
-    try:
-        resp = llm.invoke(msg)
-        content = resp.content if hasattr(resp, "content") else str(resp)
-        summary = ""
-        target_question = ""
-        for line in content.strip().split("\n"):
-            if line.upper().startswith("SUMMARY:"):
-                summary = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("TARGET_QUESTION:"):
-                target_question = line.split(":", 1)[1].strip()
-        return summary or content[:200], target_question or "Nội dung đoạn văn là gì?"
-    except Exception:
-        _ingest_logger.warning(
-            "LLM failed to generate summary/target_question for chunk (source: %s). "
-            "Falling back to text truncation.",
-            parent.metadata.get("source", "unknown"),
-            exc_info=True,
-        )
-        return parent.page_content[:200], "Nội dung đoạn văn là gì?"
-
-
 # --- Collection name ---
 
 def sanitize_collection_name(name: str) -> str:
@@ -748,9 +710,8 @@ def ingest_documents(
     source_label: str,
     collection_name: str = "rag_chatbot",
     on_progress: Optional[Callable[[str, str, int, int], None]] = None,
-    skip_summary: bool = False,
 ) -> dict[str, Any]:
-    """Ingest pre-loaded documents into Qdrant using the standard parent-child pipeline."""
+    """Ingest pre-loaded documents into the parent-child pipeline."""
     progress = on_progress or _noop_progress
     settings = get_settings()
     if not settings.openai_api_key:
@@ -772,11 +733,7 @@ def ingest_documents(
             model_kwargs={"trust_remote_code": True, "device": "cpu"},
         )
         _fix_position_ids(embeddings.client)
-    llm = ChatOpenAI(
-        model=settings.llm_model,
-        api_key=settings.openai_api_key,
-        temperature=0.2,
-    )
+
     progress("semantic", "Chunking (article)...", 0, 0)
     effective_strategy = "article"
 
@@ -791,32 +748,21 @@ def ingest_documents(
     parent_meta: dict[str, dict] = {}
 
     for i, parent in enumerate(parents):
-        progress("metadata", f"Summary for parent {i + 1}/{len(parents)}...", i + 1, len(parents))
         parent_id = hashlib.sha256(
             (parent.page_content + str(i)).encode()
         ).hexdigest()[:16]
-        if skip_summary:
-            summary = (parent.page_content[:200] + "...") if len(parent.page_content) > 200 else parent.page_content
-            target_question = "Nội dung đoạn văn là gì?"
-        else:
-            summary, target_question = add_parent_metadata(parent, llm)
 
         parent_meta[parent_id] = {
             "content": parent.page_content,
-            "summary": summary,
-            "target_question": target_question,
             "source": parent.metadata.get("source", source_label),
         }
 
         children = parent_to_children_dynamic(parent, settings, effective_strategy=effective_strategy)
         for child in children:
-            # Preserve all parent metadata then add chunking-specific metadata
             for key, value in parent.metadata.items():
                 if key not in child.metadata or key == "source":
                     child.metadata[key] = value
             child.metadata["parent_id"] = parent_id
-            child.metadata["summary"] = summary
-            child.metadata["target_question"] = target_question
             all_children.append(child)
 
     upsert_vector_parents(collection_name, parent_meta)
@@ -907,13 +853,8 @@ def ingest_file(
     *,
     collection_name: str = "rag_chatbot",
     on_progress: Optional[Callable[[str, str, int, int], None]] = None,
-    skip_summary: bool = False,
 ) -> dict[str, Any]:
-    """
-    Load file, build parent/child chunks, add metadata, store in Qdrant.
-    Returns dict with num_parents, num_children, etc. on_progress(step, msg, current, total) is optional.
-    If skip_summary is True, do not call LLM for summary/target_question (faster, uses truncation instead).
-    """
+    """Load file, build parent/child chunks, embed and store in PostgreSQL."""
     progress = on_progress or _noop_progress
     collection_name = sanitize_collection_name(collection_name)
     file_path = Path(file_path)
@@ -925,7 +866,6 @@ def ingest_file(
         source_label=str(file_path),
         collection_name=collection_name,
         on_progress=on_progress,
-        skip_summary=skip_summary,
     )
 
 

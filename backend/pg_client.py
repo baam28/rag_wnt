@@ -1,10 +1,7 @@
 """PostgreSQL singleton connection pool + all DB helper functions.
 
-Replaces mongo_client.py.  Uses psycopg (v3) with psycopg_pool for
-synchronous operations (the FastAPI endpoints are sync).
-
-All public functions mirror the old mongo_client API so the callers
-(routers, ingest, retriever, llm_usage, drug_price_tool) need minimal changes.
+Uses psycopg (v3) with psycopg_pool for synchronous operations (the FastAPI
+endpoints are sync).
 """
 
 from __future__ import annotations
@@ -89,12 +86,12 @@ def _to_int_or_none(value) -> int | None:
 # ---------------------------------------------------------------------------
 
 def get_users_collection():
-    """Return a thin proxy object that mimics the PyMongo collection API."""
+    """Return the users proxy object."""
     return _UsersProxy()
 
 
 class _UsersProxy:
-    """Sync mongo-style wrapper around the users table."""
+    """Wrapper around the users table."""
 
     def find_one(self, query: dict) -> dict | None:
         if "username" in query:
@@ -156,7 +153,7 @@ class _UsersProxy:
 
 
 def _user_row_to_doc(row: dict) -> dict:
-    """Convert a users table row to a mongo-style document."""
+    """Convert a users table row to a dict."""
     doc = dict(row)
     doc["_id"] = str(row["id"])
     # Timestamps → ISO strings
@@ -520,7 +517,7 @@ class _LLMUsageProxy:
 
 def load_vector_parents(collection_name: str) -> dict[str, dict[str, Any]]:
     rows = _q(
-        "SELECT parent_id, content, summary, target_question, source"
+        "SELECT parent_id, content, source"
         " FROM vector_parents WHERE collection_name = %s",
         (collection_name,),
     )
@@ -530,8 +527,6 @@ def load_vector_parents(collection_name: str) -> dict[str, dict[str, Any]]:
         if pid:
             out[pid] = {
                 "content": r.get("content", ""),
-                "summary": r.get("summary", ""),
-                "target_question": r.get("target_question", ""),
                 "source": r.get("source", "Unknown"),
             }
     return out
@@ -545,12 +540,10 @@ def upsert_vector_parents(collection_name: str, parent_meta: dict[str, dict[str,
         document_year = _extract_year_from_issuance_date(meta.get("issuance_date"))
         _exec(
             """INSERT INTO vector_parents
-               (collection_name, parent_id, content, summary, target_question, source, document_year, updated_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               (collection_name, parent_id, content, source, document_year, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (collection_name, parent_id) DO UPDATE SET
                    content = EXCLUDED.content,
-                   summary = EXCLUDED.summary,
-                   target_question = EXCLUDED.target_question,
                    source = EXCLUDED.source,
                    document_year = EXCLUDED.document_year,
                    updated_at = EXCLUDED.updated_at""",
@@ -558,8 +551,6 @@ def upsert_vector_parents(collection_name: str, parent_meta: dict[str, dict[str,
                 collection_name,
                 parent_id,
                 meta.get("content", ""),
-                meta.get("summary", ""),
-                meta.get("target_question", ""),
                 meta.get("source", "Unknown"),
                 document_year,
                 now,
@@ -817,7 +808,7 @@ def delete_chunks_by_source(collection_name: str, source: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Year helpers (mirrored from old mongo_client.py)
+# Year helpers
 # ---------------------------------------------------------------------------
 
 def _extract_year_from_source(source: str) -> int | None:

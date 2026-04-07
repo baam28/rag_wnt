@@ -588,7 +588,6 @@ def fetch_parent_context(
             if content:
                 context_list.append({
                     "content": content,
-                    "summary": meta.get("summary", ""),
                     "source": meta.get("source", "Unknown"),
                     "rank": i + 1,
                     "score": score,
@@ -599,7 +598,6 @@ def fetch_parent_context(
         parent = parents.get(parent_id, {})
         context_list.append({
             "content": parent.get("content", meta.get("parent_content", "")),
-            "summary": parent.get("summary", meta.get("summary", "")),
             "source": parent.get("source", meta.get("source", "Unknown")),
             "rank": len(context_list) + 1,
             "score": score,
@@ -792,7 +790,6 @@ def _context_aware_rescore(
         haystack = " ".join(
             [
                 str(ctx.get("content", "")),
-                str(ctx.get("summary", "")),
                 str(ctx.get("source", "")),
                 str(ctx.get("collection_name", "")),
             ]

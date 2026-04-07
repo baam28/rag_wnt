@@ -59,7 +59,6 @@ function AdminPage({
     collectionName,
     newCollectionMode,
     newCollectionName,
-    skipSummary,
     ingestStatus,
     ingestProgress,
     isIngesting,
@@ -74,7 +73,6 @@ function AdminPage({
     setCollectionName,
     setNewCollectionMode,
     setNewCollectionName,
-    setSkipSummary,
     setSelectedCollection,
     setDocsQuery,
     setFeedbackTab,
@@ -451,24 +449,7 @@ function AdminPage({
                   ))}
                 </select>
               </div>
-              <div className="admin-field">
-                <label
-                  className="admin-label"
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "0.5rem",
-                    cursor: "pointer",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={skipSummary}
-                    onChange={(e) => setSkipSummary(e.target.checked)}
-                  />
-                  Bỏ qua tóm tắt (nhanh hơn, không gọi LLM)
-                </label>
-              </div>
+
               <div
                 className="admin-actions"
                 style={{ flexWrap: "wrap", gap: "0.5rem" }}

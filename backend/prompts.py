@@ -175,21 +175,12 @@ def _format_context_item(
     per_item_soft_cap_tokens: int,
 ) -> str:
     source = _clean_source_name(ctx.get("source", "Unknown"))
-    summary = (ctx.get("summary") or "").strip()
     content = (ctx.get("content") or "").strip()
     rank = _context_rank(ctx)
 
-    # Keep summary + head of the content first (soft cap by token, not char).
     body_parts: list[str] = []
-    if summary:
-        body_parts.append(f"Tóm tắt: {summary}")
     if content:
-        if summary:
-            summary_tokens = _count_tokens(body_parts[0], encoder)
-            content_budget = max(40, per_item_soft_cap_tokens - summary_tokens)
-        else:
-            content_budget = per_item_soft_cap_tokens
-        body_parts.append(_truncate_to_tokens(content, content_budget, encoder))
+        body_parts.append(_truncate_to_tokens(content, per_item_soft_cap_tokens, encoder))
 
     body = "\n".join([p for p in body_parts if p]).strip()
     if include_labels:

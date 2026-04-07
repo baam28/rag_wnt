@@ -85,7 +85,7 @@ function App() {
   const [isIngesting, setIsIngesting] = useState(false);
   const [ingestProgress, setIngestProgress] = useState(null);
   const [currentJobId, setCurrentJobId] = useState(null);
-  const [skipSummary, setSkipSummary] = useState(false);
+
   const ingestPollRef = useRef(null);
   const abortControllerRef = useRef(null);
   const inFlightControllersRef = useRef(new Map());
@@ -586,7 +586,6 @@ function App() {
       const form = new FormData();
       uploadFiles.forEach((file) => form.append("file", file));
       form.append("collection_name", targetCollection);
-      form.append("skip_summary", skipSummary ? "true" : "false");
       const resp = await authFetch(`${API_BASE}/ingest-file?async=true`, {
         method: "POST",
         body: form,
@@ -910,7 +909,6 @@ function App() {
               collectionName,
               newCollectionMode,
               newCollectionName,
-              skipSummary,
               ingestStatus,
               ingestProgress,
               isIngesting,
@@ -924,7 +922,6 @@ function App() {
               setCollectionName,
               setNewCollectionMode,
               setNewCollectionName,
-              setSkipSummary,
               setSelectedCollection,
               setDocsQuery,
               setFeedbackTab,
@@ -953,7 +950,6 @@ function App() {
               collectionName,
               newCollectionMode,
               newCollectionName,
-              skipSummary,
               ingestStatus,
               ingestProgress,
               isIngesting,
@@ -967,7 +963,6 @@ function App() {
               setCollectionName,
               setNewCollectionMode,
               setNewCollectionName,
-              setSkipSummary,
               setSelectedCollection,
               setDocsQuery,
               setFeedbackTab,
@@ -1014,7 +1009,6 @@ function deduplicateSources(sources) {
     const entry = seen.get(key);
     if (s.content) entry.contents.push(s.content);
     if (s.page != null && !entry.pages.includes(s.page)) entry.pages.push(s.page);
-    if (s.summary && !entry.summary) entry.summary = s.summary;
   }
   return Array.from(seen.values());
 }
@@ -1355,9 +1349,6 @@ export function MessageBubble({ message, onFeedback }) {
                       Xem
                     </button>
                   </div>
-                  {s.summary && (
-                    <div className="source-card-summary">{s.summary}</div>
-                  )}
                   {expandedSource === idx && s.contents && s.contents.length > 0 && (
                     <div className="source-card-content">
                       {s.contents.map((c, ci) => (

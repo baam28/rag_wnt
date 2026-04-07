@@ -163,3 +163,5 @@ def legal_tokenize_queries(queries: Union[str, list[str]]) -> list[list[str]]:
     if isinstance(queries, str):
         queries = [queries]
     return [legal_tokenize_query(q) for q in queries]
+
+

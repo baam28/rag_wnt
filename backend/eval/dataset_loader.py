@@ -8,10 +8,10 @@ from typing import Any
 
 try:
     from config import get_settings
-    from mongo_client import load_vector_parents
+    from pg_client import load_vector_parents
 except ImportError:  # pragma: no cover
     from backend.config import get_settings
-    from backend.mongo_client import load_vector_parents
+    from backend.pg_client import load_vector_parents
 
 
 REQUIRED_FIELDS = {"question", "ground_truth", "collections"}
@@ -58,10 +58,9 @@ def _build_synthetic_from_collection(collection_name: str, max_samples: int) -> 
         target_question = str(payload.get("target_question") or "").strip()
         if not target_question:
             continue
-        summary = str(payload.get("summary") or "").strip()
         content = str(payload.get("content") or "").strip()
         source = str(payload.get("source") or "Unknown")
-        ground_truth = summary or content[:400]
+        ground_truth = content[:400]
         if not ground_truth:
             continue
         samples.append(
