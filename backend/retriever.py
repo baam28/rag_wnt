@@ -8,14 +8,16 @@ from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_voyageai import VoyageAIEmbeddings
 from sentence_transformers import CrossEncoder
 
-from config import get_settings
+from config import get_settings, get_runtime_embedding_settings, get_runtime_llm_settings
 from legal_tokenizer import legal_tokenize_query as _legal_tokenize_query
 from pg_client import (
     load_sparse_bm25_stats,
     load_sparse_vocab_map,
     load_vector_parents,
+    load_sibling_parent_ids,
     similarity_search,
 )
 from utils import fix_position_ids as _fix_position_ids, tokenize_for_sparse as _tokenize_for_sparse
@@ -489,50 +491,68 @@ def get_reranker() -> CrossEncoder:
 
 _embeddings: Any = None
 _embeddings_lock = threading.Lock()
-_llm: Optional[ChatOpenAI] = None
+_embeddings_model: str = ""   # tracks which model the singleton was built for
+_llm: Any = None
+_llm_key: str = ""            # tracks provider+model so singleton resets on change
 _llm_lock = threading.Lock()
+
+
+def _build_embeddings(rt: dict):
+    """Instantiate the correct embedding client from a runtime-settings dict."""
+    model = rt.get("model") or "voyage-law-2"
+    if model.startswith("voyage-"):
+        return VoyageAIEmbeddings(
+            model=model,
+            voyage_api_key=rt.get("voyage_api_key") or None,
+        )
+    if model.startswith("text-embedding"):
+        return OpenAIEmbeddings(
+            model=model,
+            api_key=rt.get("openai_api_key") or "",
+        )
+    # HuggingFace fallback
+    emb = HuggingFaceEmbeddings(
+        model_name=model,
+        model_kwargs={"trust_remote_code": True, "device": "cpu"},
+    )
+    _fix_position_ids(emb.client)
+    return emb
 
 
 def get_embeddings():
     """Return a process-wide singleton embedding client.
 
-    HuggingFace model loading takes 3-10 s; we only want to pay that cost once.
-    Thread-safe via double-checked locking.
+    Re-initialises automatically when the admin changes the embedding model
+    in the panel (detected by comparing the stored model name to the current
+    runtime setting).  HuggingFace model loading is slow so the singleton is
+    preserved as long as the model name stays the same.
     """
-    global _embeddings
-    if _embeddings is None:
+    global _embeddings, _embeddings_model
+    rt = get_runtime_embedding_settings()
+    current_model = rt.get("model") or ""
+    if _embeddings is None or current_model != _embeddings_model:
         with _embeddings_lock:
-            if _embeddings is None:
-                settings = get_settings()
-                if settings.embedding_model.startswith("text-embedding"):
-                    _embeddings = OpenAIEmbeddings(
-                        model=settings.embedding_model,
-                        api_key=settings.openai_api_key,
-                    )
-                else:
-                    emb = HuggingFaceEmbeddings(
-                        model_name=settings.embedding_model,
-                        model_kwargs={"trust_remote_code": True, "device": "cpu"},
-                    )
-                    _fix_position_ids(emb.client)
-                    _embeddings = emb
+            if _embeddings is None or current_model != _embeddings_model:
+                _embeddings = _build_embeddings(rt)
+                _embeddings_model = current_model
     return _embeddings
 
 
-def get_llm() -> ChatOpenAI:
-    """Return a process-wide singleton ChatOpenAI client for query expansion."""
-    global _llm
-    if _llm is None:
+def get_llm():
+    """Return a process-wide singleton chat client for query expansion.
+
+    Re-initialises automatically when the admin changes the LLM provider or
+    model in the panel (detected by comparing a provider:model key).
+    """
+    global _llm, _llm_key
+    from prompts import build_runtime_chat_client
+    rt = get_runtime_llm_settings()
+    current_key = f"{rt.get('provider')}:{rt.get('model')}"
+    if _llm is None or current_key != _llm_key:
         with _llm_lock:
-            if _llm is None:
-                settings = get_settings()
-                kwargs: dict[str, Any] = {
-                    "model": settings.llm_model,
-                    "api_key": settings.openai_api_key,
-                }
-                if not (settings.llm_model or "").lower().startswith("gpt-5"):
-                    kwargs["temperature"] = 0.1
-                _llm = ChatOpenAI(**kwargs)
+            if _llm is None or current_key != _llm_key:
+                _llm = build_runtime_chat_client(temperature=0.1)
+                _llm_key = current_key
     return _llm
 
 
@@ -576,13 +596,21 @@ def fetch_parent_context(
     """
     Get parent chunks for the top child chunks. Returns list of context dicts
     with content, summary, source for the LLM.
+
+    When an article was split into multiple sub-parents (because it exceeded
+    article_max_parent_tokens), this function also fetches the sibling parents
+    and merges them so the LLM sees the full article content.
     """
     parents = load_parents(collection_name)
-    seen_parent_ids = set()
+    seen_parent_ids: set[str] = set()
+    # Track (article_number, source) pairs already merged so we don't duplicate
+    seen_article_keys: set[tuple[str, str]] = set()
     context_list = []
+
     for i, (_, meta, score) in enumerate(top_children):
         parent_id = meta.get("parent_id")
         page = meta.get("page")
+
         if not parent_id or parent_id in seen_parent_ids:
             content = meta.get("parent_content", "")
             if content:
@@ -594,15 +622,43 @@ def fetch_parent_context(
                     "page": page,
                 })
             continue
+
         seen_parent_ids.add(parent_id)
         parent = parents.get(parent_id, {})
+        primary_content = parent.get("content", meta.get("parent_content", ""))
+        primary_source = parent.get("source", meta.get("source", "Unknown"))
+
+        # Check whether this article has sibling sub-parents (split oversize article).
+        article_number = meta.get("article_number") or ""
+        art_key = (article_number, primary_source)
+        if article_number and art_key not in seen_article_keys:
+            seen_article_keys.add(art_key)
+            try:
+                siblings = load_sibling_parent_ids(
+                    collection_name,
+                    article_number,
+                    primary_source,
+                    exclude_parent_ids=seen_parent_ids,
+                )
+                if siblings:
+                    # Merge sibling content in order; mark their parent_ids as seen
+                    sibling_parts = [primary_content]
+                    for sib in siblings:
+                        sib_pid = sib["parent_id"]
+                        seen_parent_ids.add(sib_pid)
+                        sibling_parts.append(sib["content"])
+                    primary_content = "\n".join(p for p in sibling_parts if p)
+            except Exception:
+                logger.debug("Sibling parent lookup failed for article %s", article_number, exc_info=True)
+
         context_list.append({
-            "content": parent.get("content", meta.get("parent_content", "")),
-            "source": parent.get("source", meta.get("source", "Unknown")),
+            "content": primary_content,
+            "source": primary_source,
             "rank": len(context_list) + 1,
             "score": score,
             "page": page,
         })
+
     return context_list
 
 
@@ -676,8 +732,6 @@ def retrieve(
     then runs the cross-encoder re-ranker over the combined pool to find the global top-K.
     """
     settings = get_settings()
-    if not settings.openai_api_key:
-        raise ValueError("OPENAI_API_KEY is required.")
 
     # Singletons: first call initialises; subsequent calls return instantly.
     embeddings = get_embeddings()
@@ -734,12 +788,17 @@ def retrieve(
     all_ids = [c[0] for c in combined_candidates]
     all_docs = [(c[1].get("text", "") or "") for c in combined_candidates]
 
+    effective_rerank_top_k = (
+        settings.rerank_top_k_legal
+        if settings.legal_collection_name in collections_to_search
+        else settings.rerank_top_k
+    )
     top_k = rerank(
         effective_query,
         candidates_for_rerank,
         all_docs,
         all_ids,
-        top_k=settings.rerank_top_k,
+        top_k=effective_rerank_top_k,
     )
 
     if settings.legal_collection_name in collections_to_search:
@@ -748,7 +807,7 @@ def retrieve(
             reranked=top_k,
             combined_candidates=combined_candidates,
             legal_collection_name=settings.legal_collection_name,
-            extra_k=2,
+            extra_k=4,
         )
 
     # Re-attach collection names and fetch parent contexts
@@ -878,7 +937,7 @@ def _augment_legal_article_candidates(
     current_mentions = sum(
         1 for _doc_id, meta, _score in reranked if _mentions_article(str(meta.get("text", "") or ""), article_no)
     )
-    if current_mentions >= 2:
+    if current_mentions >= 4:
         return reranked
 
     selected_ids = {doc_id for doc_id, _meta, _score in reranked}

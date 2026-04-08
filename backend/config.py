@@ -13,7 +13,10 @@ class Settings(BaseSettings):
     """App settings loaded from environment."""
 
     openai_api_key: str = ""
-    embedding_model: str = "text-embedding-3-small"
+    anthropic_api_key: str = ""
+    voyage_api_key: str = ""
+    llm_provider: str = "openai"  # "openai" | "anthropic"
+    embedding_model: str = "voyage-law-2"
     llm_model: str = "gpt-4o-mini"
     llm_fallback_model: str = "gpt-4o-mini"
     reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
@@ -22,10 +25,10 @@ class Settings(BaseSettings):
     llm_history_budget_ratio: float = 0.12
     llm_max_output_tokens_default: int = 900
     llm_max_output_tokens_legal: int = 1400
-    llm_context_chunk_soft_cap_tokens: int = 320
+    llm_context_chunk_soft_cap_tokens: int = 700
 
     # Chunk sizes
-    article_max_parent_tokens: int = 1200  # oversized articles are split further
+    article_max_parent_tokens: int = 3000  # oversized articles are split further
 
     # Embedding parallelism
     embed_batch_size: int = 64
@@ -36,6 +39,7 @@ class Settings(BaseSettings):
     query_expansion_count: int = 3
     hybrid_top_k: int = 20
     rerank_top_k: int = 5
+    rerank_top_k_legal: int = 8  # higher top-k for legal queries (multi-khoản articles)
 
     # Rate limiting (slowapi format: "N/period" where period = second/minute/hour)
     ask_rate_limit: str = "20/minute"
@@ -47,6 +51,11 @@ class Settings(BaseSettings):
 
     # Whether to apply context-aware rescoring after retrieval
     enable_context_rescore: bool = True
+
+    # Cross-reference resolution: auto-detect article references in LLM answers
+    # and fetch + re-generate with the referenced content (legal queries only).
+    enable_crossref_resolution: bool = True
+    crossref_max_refs: int = 3  # max refs to resolve per answer
 
     # BM25 sparse scoring parameters (Okapi BM25)
     bm25_k1: float = 1.5   # term frequency saturation
@@ -95,4 +104,53 @@ def get_settings() -> Settings:
     # Fall back to the bare env var in case .env omits OPENAI_API_KEY
     if not s.openai_api_key:
         s.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+    if not s.anthropic_api_key:
+        s.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not s.voyage_api_key:
+        s.voyage_api_key = os.getenv("VOYAGE_API_KEY", "")
     return s
+
+
+def get_runtime_llm_settings() -> dict:
+    """Return the active LLM provider/model/api_key, preferring DB overrides.
+
+    Reads from the app_settings table (set by admin panel).  Falls back to
+    the static config/env values so the system works without any DB override.
+    """
+    from pg_client import get_app_setting  # local import to avoid circular deps
+
+    static = get_settings()
+    provider = get_app_setting("llm_provider") or static.llm_provider or "openai"
+    model = get_app_setting("llm_model") or ""
+    openai_key = get_app_setting("openai_api_key") or static.openai_api_key
+    anthropic_key = get_app_setting("anthropic_api_key") or static.anthropic_api_key
+
+    # Default model per provider when nothing is set in DB
+    if not model:
+        if provider == "anthropic":
+            model = "claude-sonnet-4-6"
+        else:
+            model = static.llm_model or "gpt-4o-mini"
+
+    return {
+        "provider": provider,
+        "model": model,
+        "openai_api_key": openai_key,
+        "anthropic_api_key": anthropic_key,
+    }
+
+
+def get_runtime_embedding_settings() -> dict:
+    """Return the active embedding model and API keys, preferring DB overrides."""
+    from pg_client import get_app_setting  # local import to avoid circular deps
+
+    static = get_settings()
+    model = get_app_setting("embedding_model") or static.embedding_model or "voyage-law-2"
+    openai_key = get_app_setting("openai_api_key") or static.openai_api_key
+    voyage_key = get_app_setting("voyage_api_key") or static.voyage_api_key
+
+    return {
+        "model": model,
+        "openai_api_key": openai_key,
+        "voyage_api_key": voyage_key,
+    }

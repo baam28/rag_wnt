@@ -5,7 +5,6 @@ Expands compound legal references (Điều, Khoản, Điểm, document numbers)
 into dedicated tokens alongside standard word tokens, improving sparse
 retrieval recall for queries containing specific legal citations.
 
-Inspired by: ai-challenge-legal/arlc/indexing/legal_tokenizer.py
 """
 
 import re

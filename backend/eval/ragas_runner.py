@@ -9,6 +9,7 @@ from typing import Any
 from datasets import Dataset
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_voyageai import VoyageAIEmbeddings
 
 try:
     from config import get_settings
@@ -45,13 +46,15 @@ CORE_METRICS = {
 
 
 def _build_eval_embeddings(settings):
-    if settings.embedding_model.startswith("text-embedding"):
-        return OpenAIEmbeddings(model=settings.embedding_model, api_key=settings.openai_api_key)
-    emb = HuggingFaceEmbeddings(
-        model_name=settings.embedding_model,
+    model = settings.embedding_model
+    if model.startswith("voyage-"):
+        return VoyageAIEmbeddings(model=model, voyage_api_key=settings.voyage_api_key or None)
+    if model.startswith("text-embedding"):
+        return OpenAIEmbeddings(model=model, api_key=settings.openai_api_key)
+    return HuggingFaceEmbeddings(
+        model_name=model,
         model_kwargs={"trust_remote_code": True, "device": "cpu"},
     )
-    return emb
 
 
 def _select_metrics(metric_names: list[str]) -> list[Any]:

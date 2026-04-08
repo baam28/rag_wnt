@@ -98,6 +98,115 @@ function AdminPage({
 
   const [pwdForm, setPwdForm] = React.useState({ userId: null, value: "" });
 
+  // API settings state
+  const [apiSettings, setApiSettings] = React.useState(null);
+  const [apiSettingsLoading, setApiSettingsLoading] = React.useState(false);
+  const [apiSettingsSaving, setApiSettingsSaving] = React.useState(false);
+  const [apiSettingsMsg, setApiSettingsMsg] = React.useState(null); // { type: "success"|"error", text }
+  const [apiForm, setApiForm] = React.useState({
+    provider: "openai",
+    model: "gpt-4o-mini",
+    openai_api_key: "",
+    anthropic_api_key: "",
+    embedding_model: "voyage-law-2",
+    embedding_provider: "voyageai",
+    voyage_api_key: "",
+  });
+
+  const OPENAI_MODELS = [
+    { value: "gpt-4o", label: "GPT-4o" },
+    { value: "gpt-4o-mini", label: "GPT-4o Mini" },
+    { value: "gpt-4-turbo", label: "GPT-4 Turbo" },
+    { value: "gpt-3.5-turbo", label: "GPT-3.5 Turbo" },
+  ];
+  const ANTHROPIC_MODELS = [
+    { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
+    { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+    { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
+  ];
+
+  const EMBEDDING_PROVIDERS = [
+    { value: "voyageai", label: "Voyage AI" },
+    { value: "openai", label: "OpenAI" },
+  ];
+  const VOYAGE_EMBEDDING_MODELS = [
+    { value: "voyage-law-2", label: "voyage-law-2 (legal)" },
+    { value: "voyage-3", label: "voyage-3" },
+    { value: "voyage-3-lite", label: "voyage-3-lite" },
+    { value: "voyage-3-large", label: "voyage-3-large" },
+    { value: "voyage-finance-2", label: "voyage-finance-2" },
+  ];
+  const OPENAI_EMBEDDING_MODELS = [
+    { value: "text-embedding-3-small", label: "text-embedding-3-small" },
+    { value: "text-embedding-3-large", label: "text-embedding-3-large" },
+    { value: "text-embedding-ada-002", label: "text-embedding-ada-002" },
+  ];
+
+  function embProviderFromModel(model) {
+    if ((model || "").startsWith("voyage-")) return "voyageai";
+    if ((model || "").startsWith("text-embedding")) return "openai";
+    return "voyageai";
+  }
+
+  async function fetchApiSettings() {
+    setApiSettingsLoading(true);
+    setApiSettingsMsg(null);
+    try {
+      const resp = await authFetch("/admin/api-settings");
+      if (resp.ok) {
+        const data = await resp.json();
+        setApiSettings(data);
+        setApiForm({
+          provider: data.provider || "openai",
+          model: data.model || "gpt-4o-mini",
+          openai_api_key: "",
+          anthropic_api_key: "",
+          embedding_model: data.embedding_model || "voyage-law-2",
+          embedding_provider: embProviderFromModel(data.embedding_model),
+          voyage_api_key: "",
+        });
+      } else {
+        setApiSettingsMsg({ type: "error", text: "Không tải được cấu hình API." });
+      }
+    } catch {
+      setApiSettingsMsg({ type: "error", text: "Lỗi kết nối." });
+    }
+    setApiSettingsLoading(false);
+  }
+
+  async function handleSaveApiSettings(e) {
+    e.preventDefault();
+    setApiSettingsSaving(true);
+    setApiSettingsMsg(null);
+    try {
+      const body = {
+        provider: apiForm.provider,
+        model: apiForm.model,
+        embedding_model: apiForm.embedding_model,
+      };
+      if (apiForm.openai_api_key.trim()) body.openai_api_key = apiForm.openai_api_key.trim();
+      if (apiForm.anthropic_api_key.trim()) body.anthropic_api_key = apiForm.anthropic_api_key.trim();
+      if (apiForm.voyage_api_key.trim()) body.voyage_api_key = apiForm.voyage_api_key.trim();
+      const resp = await authFetch("/admin/api-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setApiSettings(data);
+        setApiForm(f => ({ ...f, openai_api_key: "", anthropic_api_key: "", voyage_api_key: "" }));
+        setApiSettingsMsg({ type: "success", text: "Đã lưu cấu hình API." });
+      } else {
+        const err = await resp.json();
+        setApiSettingsMsg({ type: "error", text: "Lỗi: " + (err.detail || "Không thể lưu.") });
+      }
+    } catch {
+      setApiSettingsMsg({ type: "error", text: "Lỗi kết nối." });
+    }
+    setApiSettingsSaving(false);
+  }
+
   React.useEffect(() => {
     setDocFilters(docsQuery || { ...DOCS_DEFAULT_QUERY });
   }, [docsQuery]);
@@ -153,6 +262,8 @@ function AdminPage({
       if (collections.length === 0) fetchCollections();
     } else if (activeTab === "feedback" && !feedbackData) {
       fetchFeedback();
+    } else if (activeTab === "api" && !apiSettings) {
+      fetchApiSettings();
     }
   }, [activeTab]);
 
@@ -229,6 +340,10 @@ function AdminPage({
           <button className={"admin-tab" + (activeTab === "feedback" ? " active" : "")} onClick={() => setActiveTab("feedback")}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z"/><path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>
             Đánh giá
+          </button>
+          <button className={"admin-tab" + (activeTab === "api" ? " active" : "")} onClick={() => setActiveTab("api")}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><path d="M7 8h.01M11 8h6"/></svg>
+            Cấu hình API
           </button>
         </div>
 
@@ -900,6 +1015,243 @@ function AdminPage({
             </p>
           )}
         </div>
+        )}
+
+        {activeTab === "api" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+
+            {/* ── Active model summary ──────────────────────────────── */}
+            {apiSettings && (
+              <div style={{
+                display: "flex", gap: "0.75rem", flexWrap: "wrap",
+                padding: "0.75rem 1rem", borderRadius: "10px",
+                background: "#f8fafc", border: "1px solid #e2e8f0", fontSize: "0.85rem",
+              }}>
+                <span style={{ color: "#64748b" }}>Đang dùng:</span>
+                <span style={{ fontWeight: 600, color: "#0f172a" }}>
+                  {apiSettings.model}
+                  <span style={{
+                    marginLeft: "0.4rem", padding: "0.1rem 0.5rem", borderRadius: "999px",
+                    fontSize: "0.72rem", fontWeight: 500,
+                    background: apiSettings.provider === "anthropic" ? "#fdf4ff" : "#eff6ff",
+                    color: apiSettings.provider === "anthropic" ? "#7c3aed" : "#2563eb",
+                  }}>
+                    {apiSettings.provider === "anthropic" ? "Anthropic" : "OpenAI"}
+                  </span>
+                </span>
+                <span style={{ color: "#cbd5e1" }}>·</span>
+                <span style={{ color: "#64748b" }}>Embedding:</span>
+                <span style={{ fontWeight: 600, color: "#0f172a" }}>
+                  {apiSettings.embedding_model}
+                  <span style={{
+                    marginLeft: "0.4rem", padding: "0.1rem 0.5rem", borderRadius: "999px",
+                    fontSize: "0.72rem", fontWeight: 500,
+                    background: "#f0fdf4", color: "#16a34a",
+                  }}>
+                    {apiSettings.embedding_model.startsWith("voyage-") ? "Voyage AI" : "OpenAI"}
+                  </span>
+                </span>
+              </div>
+            )}
+
+            <div className="admin-card">
+              <div className="admin-row admin-row--head" style={{ marginBottom: "1.5rem" }}>
+                <h2 className="admin-card-title" style={{ flex: 1 }}>Cấu hình API</h2>
+                <button className="btn btn-ghost btn-sm" type="button" onClick={fetchApiSettings} disabled={apiSettingsLoading}>
+                  {apiSettingsLoading ? "Đang tải..." : "Làm mới"}
+                </button>
+              </div>
+
+              {apiSettingsLoading && !apiSettings && <p className="admin-status">Đang tải...</p>}
+
+              {apiSettings && (
+                <form onSubmit={handleSaveApiSettings} style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+
+                  {/* ── LLM (Output) ──────────────────────────────────── */}
+                  <div>
+                    <p style={{ fontSize: "0.8rem", fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "1rem" }}>
+                      LLM — Model trả lời
+                    </p>
+
+                    {/* Provider */}
+                    <div className="admin-field" style={{ marginBottom: "1rem" }}>
+                      <label className="admin-label">Provider</label>
+                      <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+                        {[{ value: "openai", label: "OpenAI" }, { value: "anthropic", label: "Anthropic" }].map(p => (
+                          <label key={p.value} style={{
+                            display: "flex", alignItems: "center", gap: "0.4rem",
+                            padding: "0.5rem 1rem", borderRadius: "8px", cursor: "pointer",
+                            border: `2px solid ${apiForm.provider === p.value ? "#2563eb" : "#e5e7eb"}`,
+                            background: apiForm.provider === p.value ? "#eff6ff" : "#fff",
+                            fontWeight: apiForm.provider === p.value ? 600 : 400,
+                            fontSize: "0.9rem", transition: "all 0.15s",
+                          }}>
+                            <input type="radio" name="llm_provider" value={p.value}
+                              checked={apiForm.provider === p.value}
+                              onChange={() => {
+                                const def = p.value === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini";
+                                setApiForm(f => ({ ...f, provider: p.value, model: def, openai_api_key: "", anthropic_api_key: "" }));
+                              }}
+                              style={{ accentColor: "#2563eb" }} />
+                            {p.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Model */}
+                    <div className="admin-field" style={{ marginBottom: "1rem" }}>
+                      <label className="admin-label">Model</label>
+                      <select className="admin-input" value={apiForm.model}
+                        onChange={e => setApiForm(f => ({ ...f, model: e.target.value }))}
+                        style={{ maxWidth: "320px" }}>
+                        {(apiForm.provider === "anthropic" ? ANTHROPIC_MODELS : OPENAI_MODELS).map(m => (
+                          <option key={m.value} value={m.value}>{m.label}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* API key — only for the selected provider */}
+                    {apiForm.provider === "openai" && (
+                      <div className="admin-field">
+                        <label className="admin-label">
+                          OpenAI API Key
+                          {apiSettings.openai_api_key_set && (
+                            <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#16a34a", fontWeight: 400 }}>
+                              ✓ đã lưu ({apiSettings.openai_api_key_hint})
+                            </span>
+                          )}
+                        </label>
+                        <input type="password" className="admin-input" style={{ maxWidth: "420px" }}
+                          placeholder={apiSettings.openai_api_key_set ? "Để trống = giữ key hiện tại" : "sk-..."}
+                          value={apiForm.openai_api_key}
+                          onChange={e => setApiForm(f => ({ ...f, openai_api_key: e.target.value }))}
+                          autoComplete="new-password" />
+                      </div>
+                    )}
+
+                    {apiForm.provider === "anthropic" && (
+                      <div className="admin-field">
+                        <label className="admin-label">
+                          Anthropic API Key
+                          {apiSettings.anthropic_api_key_set && (
+                            <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#16a34a", fontWeight: 400 }}>
+                              ✓ đã lưu ({apiSettings.anthropic_api_key_hint})
+                            </span>
+                          )}
+                        </label>
+                        <input type="password" className="admin-input" style={{ maxWidth: "420px" }}
+                          placeholder={apiSettings.anthropic_api_key_set ? "Để trống = giữ key hiện tại" : "sk-ant-..."}
+                          value={apiForm.anthropic_api_key}
+                          onChange={e => setApiForm(f => ({ ...f, anthropic_api_key: e.target.value }))}
+                          autoComplete="new-password" />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ── Embedding ─────────────────────────────────────── */}
+                  <div style={{ borderTop: "1px solid #e5e7eb", paddingTop: "1.5rem" }}>
+                    <p style={{ fontSize: "0.8rem", fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "1rem" }}>
+                      Embedding
+                    </p>
+
+                    {/* Embedding Provider */}
+                    <div className="admin-field" style={{ marginBottom: "1rem" }}>
+                      <label className="admin-label">Provider</label>
+                      <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+                        {EMBEDDING_PROVIDERS.map(p => (
+                          <label key={p.value} style={{
+                            display: "flex", alignItems: "center", gap: "0.4rem",
+                            padding: "0.5rem 1rem", borderRadius: "8px", cursor: "pointer",
+                            border: `2px solid ${apiForm.embedding_provider === p.value ? "#2563eb" : "#e5e7eb"}`,
+                            background: apiForm.embedding_provider === p.value ? "#eff6ff" : "#fff",
+                            fontWeight: apiForm.embedding_provider === p.value ? 600 : 400,
+                            fontSize: "0.9rem", transition: "all 0.15s",
+                          }}>
+                            <input type="radio" name="emb_provider" value={p.value}
+                              checked={apiForm.embedding_provider === p.value}
+                              onChange={() => {
+                                const def = p.value === "openai" ? "text-embedding-3-small" : "voyage-law-2";
+                                setApiForm(f => ({ ...f, embedding_provider: p.value, embedding_model: def, voyage_api_key: "" }));
+                              }}
+                              style={{ accentColor: "#2563eb" }} />
+                            {p.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Embedding Model */}
+                    <div className="admin-field" style={{ marginBottom: "1rem" }}>
+                      <label className="admin-label">Model</label>
+                      <select className="admin-input" value={apiForm.embedding_model}
+                        onChange={e => setApiForm(f => ({ ...f, embedding_model: e.target.value }))}
+                        style={{ maxWidth: "320px" }}>
+                        {(apiForm.embedding_provider === "openai" ? OPENAI_EMBEDDING_MODELS : VOYAGE_EMBEDDING_MODELS).map(m => (
+                          <option key={m.value} value={m.value}>{m.label}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* API key — only for the selected embedding provider */}
+                    {apiForm.embedding_provider === "voyageai" && (
+                      <div className="admin-field">
+                        <label className="admin-label">
+                          Voyage AI API Key
+                          {apiSettings.voyage_api_key_set && (
+                            <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#16a34a", fontWeight: 400 }}>
+                              ✓ đã lưu ({apiSettings.voyage_api_key_hint})
+                            </span>
+                          )}
+                        </label>
+                        <input type="password" className="admin-input" style={{ maxWidth: "420px" }}
+                          placeholder={apiSettings.voyage_api_key_set ? "Để trống = giữ key hiện tại" : "pa-..."}
+                          value={apiForm.voyage_api_key}
+                          onChange={e => setApiForm(f => ({ ...f, voyage_api_key: e.target.value }))}
+                          autoComplete="new-password" />
+                      </div>
+                    )}
+
+                    {apiForm.embedding_provider === "openai" && (
+                      <div className="admin-field">
+                        <label className="admin-label">
+                          OpenAI API Key
+                          {apiSettings.openai_api_key_set && (
+                            <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#16a34a", fontWeight: 400 }}>
+                              ✓ đã lưu ({apiSettings.openai_api_key_hint})
+                            </span>
+                          )}
+                        </label>
+                        <input type="password" className="admin-input" style={{ maxWidth: "420px" }}
+                          placeholder={apiSettings.openai_api_key_set ? "Để trống = giữ key hiện tại" : "sk-..."}
+                          value={apiForm.openai_api_key}
+                          onChange={e => setApiForm(f => ({ ...f, openai_api_key: e.target.value }))}
+                          autoComplete="new-password" />
+                      </div>
+                    )}
+                  </div>
+
+                  {apiSettingsMsg && (
+                    <p style={{
+                      padding: "0.5rem 0.75rem", borderRadius: "6px", fontSize: "0.875rem",
+                      background: apiSettingsMsg.type === "success" ? "#f0fdf4" : "#fef2f2",
+                      color: apiSettingsMsg.type === "success" ? "#16a34a" : "#dc2626",
+                      border: `1px solid ${apiSettingsMsg.type === "success" ? "#bbf7d0" : "#fecaca"}`,
+                      margin: 0,
+                    }}>
+                      {apiSettingsMsg.text}
+                    </p>
+                  )}
+
+                  <div>
+                    <button type="submit" className="btn btn-primary" disabled={apiSettingsSaving} style={{ minWidth: "120px" }}>
+                      {apiSettingsSaving ? "Đang lưu..." : "Lưu cấu hình"}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </div>
         )}
 
         </div>

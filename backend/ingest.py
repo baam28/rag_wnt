@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -13,7 +14,8 @@ from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from config import get_settings
+from langchain_voyageai import VoyageAIEmbeddings
+from config import get_settings, get_runtime_embedding_settings
 from legal_tokenizer import legal_tokenize as _legal_tokenize
 from pg_client import (
     insert_sparse_vocab_entries,
@@ -563,17 +565,35 @@ def parent_to_children_dynamic(parent: Document, settings, *, effective_strategy
     text = parent.page_content or ""
     chunks = _split_clauses(text)
 
+    article_no = parent.metadata.get("article_number", "")
+    article_title = parent.metadata.get("article_title", "")
+
     children: list[Document] = []
     for i, c in enumerate(chunks):
         content = c.strip()
         if not content:
             continue
+
+        # Prepend article + khoản context so each child chunk is self-contained.
+        # Only applies to legal article chunks where a numbered clause ("1. " "2. ")
+        # is detected — sentence-split fallback chunks are left unchanged.
+        clause_match = _CLAUSE_RE.match(content)
+        if clause_match and article_no:
+            clause_no = clause_match.group(1)
+            header = (
+                f"Điều {article_no}, khoản {clause_no} ({article_title}): "
+                if article_title
+                else f"Điều {article_no}, khoản {clause_no}: "
+            )
+            content = header + content
+
         children.append(
             Document(
                 page_content=content,
                 metadata={
                     **parent.metadata,
                     "chunk_index": i,
+                    "clause_number": clause_match.group(1) if clause_match else None,
                     "parent_content": text,
                 },
             )
@@ -722,14 +742,21 @@ def ingest_documents(
 
     progress("load", f"Loaded {len(documents)} page(s)", 1, 1)
 
-    if settings.embedding_model.startswith("text-embedding"):
+    emb_rt = get_runtime_embedding_settings()
+    model = emb_rt.get("model") or "voyage-law-2"
+    if model.startswith("voyage-"):
+        embeddings = VoyageAIEmbeddings(
+            model=model,
+            voyage_api_key=emb_rt.get("voyage_api_key") or None,
+        )
+    elif model.startswith("text-embedding"):
         embeddings = OpenAIEmbeddings(
-            model=settings.embedding_model,
-            api_key=settings.openai_api_key,
+            model=model,
+            api_key=emb_rt.get("openai_api_key") or "",
         )
     else:
         embeddings = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model,
+            model_name=model,
             model_kwargs={"trust_remote_code": True, "device": "cpu"},
         )
         _fix_position_ids(embeddings.client)

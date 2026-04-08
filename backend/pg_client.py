@@ -532,6 +532,41 @@ def load_vector_parents(collection_name: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def load_sibling_parent_ids(
+    collection_name: str,
+    article_number: str,
+    source: str,
+    exclude_parent_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return all vector_parents that belong to the same article/source pair.
+
+    Useful when an article was split into multiple parents (e.g. khoản 1-6 in
+    one parent, khoản 7-11 in another).  Joining through vector_chunks.payload
+    lets us find siblings without requiring an extra schema column.
+    """
+    rows = _q(
+        """SELECT DISTINCT vp.parent_id, vp.content, vp.source
+           FROM vector_parents vp
+           JOIN vector_chunks vc
+             ON vc.collection_name = vp.collection_name
+            AND vc.parent_id = vp.parent_id
+           WHERE vp.collection_name = %s
+             AND vc.payload->>'article_number' = %s
+             AND vc.payload->>'source' = %s""",
+        (collection_name, article_number, source),
+    )
+    exclude = exclude_parent_ids or set()
+    return [
+        {
+            "parent_id": str(r["parent_id"]),
+            "content": r.get("content") or "",
+            "source": r.get("source") or "Unknown",
+        }
+        for r in rows
+        if str(r["parent_id"]) not in exclude
+    ]
+
+
 def upsert_vector_parents(collection_name: str, parent_meta: dict[str, dict[str, Any]]) -> None:
     if not parent_meta:
         return
@@ -805,6 +840,54 @@ def delete_chunks_by_source(collection_name: str, source: str) -> int:
         (collection_name, source),
     )
     return cnt
+
+
+# ---------------------------------------------------------------------------
+# App Settings (runtime key-value config)
+# ---------------------------------------------------------------------------
+
+def _ensure_app_settings_table() -> None:
+    """Create app_settings table if it does not exist yet."""
+    try:
+        with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS app_settings "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"
+            )
+    except Exception:
+        pass
+
+
+def get_app_setting(key: str, default: str = "") -> str:
+    """Return a single app setting value, or *default* if not set."""
+    try:
+        rows = _q("SELECT value FROM app_settings WHERE key = %s", (key,))
+        if rows:
+            return str(rows[0]["value"] or "")
+    except Exception:
+        pass
+    return default
+
+
+def set_app_setting(key: str, value: str) -> None:
+    """Upsert a single app setting."""
+    try:
+        _exec(
+            "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (key, value),
+        )
+    except Exception:
+        # Table may not exist yet — create it and retry once.
+        _ensure_app_settings_table()
+        try:
+            _exec(
+                "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, value),
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

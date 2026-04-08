@@ -11,7 +11,12 @@ except Exception:  # pragma: no cover - fallback when tokenizer lib unavailable
 
 from langchain_openai import ChatOpenAI
 
-from config import get_settings
+try:
+    from langchain_anthropic import ChatAnthropic
+except ImportError:  # pragma: no cover
+    ChatAnthropic = None  # type: ignore[assignment,misc]
+
+from config import get_settings, get_runtime_llm_settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +30,8 @@ Nguyên tắc:
 - Cách trích dẫn: viết tên văn bản đúng như trong dấu ngoặc vuông của context (ví dụ: [Luật Dược, số 105/2016/QH13]).
   KHÔNG thêm phần trong ngoặc đơn theo sau, chỉ viết mình tên văn bản trong [], không dùng [Source N].
 - Chỉ nói "không có đủ thông tin" khi context thực sự không đề cập đến vấn đề được hỏi.
+- Khi context đã cung cấp nội dung của điều khoản được dẫn chiếu (ví dụ: "quy định tại khoản 1 Điều 13"), hãy trích dẫn và trình bày nội dung đó trực tiếp thay vì chỉ nhắc đến số điều.
+- Khi câu hỏi hỏi về một khoản/mục cụ thể (ví dụ: "trách nhiệm", "quyền", "điều kiện"), chỉ trả lời đúng khoản đó — không trộn lẫn nội dung từ khoản khác trong cùng điều luật.
 - Trả lời bằng tiếng Việt, ngắn gọn, mạch lạc."""
 
 
@@ -34,14 +41,13 @@ USER_PROMPT_TEMPLATE = """Context (các đoạn trích từ tài liệu, mỗi �
 
 Câu hỏi: {question}
 
-Hướng dẫn cấu trúc câu trả lời (theo đúng thứ tự này):
-1. Mở đầu: "Căn cứ vào [điều khoản cụ thể] [Tên văn bản] có hiệu lực từ ngày [ngày hiệu lực] thì [chủ đề câu hỏi] được quy định như sau:" – nếu không xác định được ngày hiệu lực từ context, bỏ phần "có hiệu lực từ ngày ...".
-2. In đậm tiêu đề điều khoản: "**Điều X. [Tên điều khoản]**", sau đó dán nguyên văn điều khoản liên quan từ context dưới dạng blockquote bằng cách thêm "> " vào đầu mỗi dòng. Mỗi khoản trên một dòng riêng bắt đầu bằng "> ", giữ đúng số thứ tự khoản.
-3. Nếu có văn bản sửa đổi/bổ sung: trình bày rõ quy định cũ và mới, áp dụng quy định hiện hành.
-4. Kết luận: bắt đầu bằng "Như vậy," – tóm tắt các điều kiện/nội dung chính dưới dạng danh sách gạch đầu dòng.
-5. Nếu người dùng có thể cần thêm thông tin liên quan (ví dụ nội dung của điều khác được dẫn chiếu), gợi ý ngắn gọn ở cuối.
-
-Quy tắc trích dẫn: viết [Tên văn bản] đúng theo nhãn trong context. KHÔNG thêm phần ngoặc đơn nào sau tên văn bản. Không dùng [Source N]."""
+Hướng dẫn trả lời:
+- KHÔNG diễn giải lại (paraphrase) hay đơn giản hóa nội dung. Sự chính xác tuyệt đối là quan trọng nhất. Hãy giữ đúng thuật ngữ pháp lý và chuyên môn từ context.
+- Phân tích và trả lời mạch lạc, đi thẳng vào trọng tâm. Không cần tuân theo bất kỳ cấu trúc hay khuôn mẫu cố định nào.
+- CHỈ trích dẫn quy định pháp lý (tên nghị định, điều khoản) đối với các câu hỏi pháp lý và chỉ khi thực sự cần thiết để chứng minh căn cứ.
+- Quy tắc trích dẫn pháp lý (khi dùng): viết [Tên văn bản] đúng theo nhãn trong context. KHÔNG thêm phần ngoặc đơn nào sau tên văn bản. Không dùng [Source N].
+- Nếu có văn bản sửa đổi/bổ sung: trình bày nguyên tắc và áp dụng quy định mới nhất một cách ngắn gọn.
+- Nếu context bao gồm nội dung của điều khoản được dẫn chiếu, hãy trình bày nội dung đó thay vì chỉ viết "theo quy định tại Điều X". Không để người đọc phải tra cứu thêm khi đã có đủ thông tin."""
 
 
 DRUG_SYSTEM_PROMPT = """Bạn là trợ lý dược học, trả lời các câu hỏi về thuốc và thông tin y tế dựa trên context được cung cấp.
@@ -80,6 +86,7 @@ Hướng dẫn trả lời:
 PRICE_SYSTEM_PROMPT = """Bạn là chuyên viên quản lý tồn kho và thông tin thuốc ERP.
 - Trả lời ĐÚNG VÀO câu hỏi — chỉ trình bày thông tin người dùng hỏi, không liệt kê thêm các trường không liên quan.
 - Ví dụ: nếu hỏi tồn kho thì chỉ trả lời số lượng tồn kho; nếu hỏi giá thì chỉ trả lời giá.
+- QUAN TRỌNG về giá: giá trong context là giá trên MỘT ĐƠN VỊ BÁN (ví dụ: giá/viên, giá/hộp, giá/chai). Luôn trình bày giá kèm đơn vị bán rõ ràng (ví dụ: "240 VNĐ/viên", "60.000 VNĐ/hộp"). Không bao giờ bỏ đơn vị khi nói về giá.
 - Không mở đầu bằng "Dưới đây là thông tin chi tiết về..." hay tương tự khi câu hỏi chỉ cần một con số.
 - Trình bày bằng Markdown ngắn gọn, rõ ràng. Giữ nguyên bảng Markdown nếu context có sẵn.
 - Trả lời bằng tiếng Việt."""
@@ -102,6 +109,8 @@ Nguyên tắc:
 - Trả lời ĐẦY ĐỦ mọi phần câu hỏi, đưa ra **kết luận rõ ràng, dứt khoát** khi đã có đủ căn cứ.
 - Cách trích dận: viết tên văn bản trong [] đúng theo nhãn trong context. KHÔNG thêm ngoặc đơn nào sau tên văn bản. Không dùng [Source N].
 - Nếu câu hỏi kết hợp pháp lý và kho: tách biệt thành 2 phần rõ rệt. Phối hợp nhịp nhàng giữa bảng Markdown dữ liệu kho và câu trả lời tư vấn pháp lý. Dữ liệu kho không được lược bớt đi định dạng.
+- Khi context đã cung cấp nội dung của điều khoản được dẫn chiếu, hãy trích dẫn và trình bày nội dung đó trực tiếp thay vì chỉ nhắc đến số điều.
+- Khi câu hỏi hỏi về một khoản/mục cụ thể (ví dụ: "trách nhiệm", "quyền", "điều kiện"), chỉ trả lời đúng khoản đó — không trộn lẫn nội dung từ khoản khác trong cùng điều luật.
 - Trả lời bằng tiếng Việt. Không bịa thông tin."""
 
 
@@ -111,7 +120,12 @@ COMBINED_USER_PROMPT_TEMPLATE = """Context (có thể gồm văn bản pháp lý
 
 Câu hỏi: {question}
 
-Hướng dẫn: Với câu hỏi pháp lý, trả lời theo cấu trúc: (1) "Căn cứ vào [điều khoản] [Tên văn bản] có hiệu lực từ ngày [ngày] thì ... được quy định như sau:" → (2) **Điều X. Tiêu đề** + nguyên văn điều khoản dưới dạng blockquote (thêm "> " vào đầu mỗi dòng khoản, mỗi khoản xuống dòng riêng) → (3) "Như vậy," + danh sách gạch đầu dòng tóm tắt. Cung cấp dữ liệu tồn kho bằng bảng Markdown y như Context phản hồi."""
+Hướng dẫn trả lời:
+- KHÔNG diễn giải lại (paraphrase) hay đơn giản hóa nội dung. Sự chính xác tuyệt đối là quan trọng nhất. Hãy sử dụng đúng thuật ngữ và câu chữ từ context.
+- Trả lời một cách mạch lạc, trực tiếp vào trọng tâm câu hỏi.
+- Đối với phần pháp lý: chỉ trích dẫn văn bản (ví dụ [Tên văn bản]) khi thực sự cần thiết để làm căn cứ. Không bị vướng bận vào một cấu trúc phản hồi cố định.
+- Đối với dữ liệu kho ERP: Cung cấp dữ liệu tồn kho bằng bảng Markdown y như Context phản hồi.
+- Nếu context bao gồm nội dung của điều khoản được dẫn chiếu, hãy trình bày nội dung đó thay vì chỉ viết "theo quy định tại Điều X"."""
 
 
 def _clean_source_name(source: str) -> str:
@@ -344,6 +358,31 @@ def _extract_usage(resp: Any) -> Dict[str, int]:
     return out
 
 
+def build_runtime_chat_client(temperature: float = 0.1):
+    """Return the appropriate chat client (OpenAI or Anthropic) from runtime DB settings.
+
+    Suitable for supervisor, query expansion, and any helper that needs a generic
+    chat LLM.  Answer-generation code should go through generate_answer() instead.
+    """
+    rt = get_runtime_llm_settings()
+    provider = (rt.get("provider") or "openai").lower()
+    model = rt.get("model") or "gpt-4o-mini"
+    if provider == "anthropic":
+        if ChatAnthropic is None:
+            raise ImportError("langchain-anthropic is not installed.")
+        return ChatAnthropic(
+            model=model,
+            api_key=rt.get("anthropic_api_key") or "",
+            temperature=temperature,
+            max_tokens=512,
+        )
+    return ChatOpenAI(
+        model=model,
+        api_key=rt.get("openai_api_key") or "",
+        temperature=temperature,
+    )
+
+
 def _build_chat_openai_client(
     model_name: str,
     api_key: str,
@@ -362,6 +401,22 @@ def _build_chat_openai_client(
     return ChatOpenAI(**kwargs)
 
 
+def _build_chat_anthropic_client(
+    model_name: str,
+    api_key: str,
+    temperature: float,
+    max_output_tokens: int,
+):
+    if ChatAnthropic is None:
+        raise ImportError("langchain-anthropic is not installed. Run: pip install langchain-anthropic")
+    return ChatAnthropic(
+        model=model_name,
+        api_key=api_key,
+        temperature=temperature,
+        max_tokens=max_output_tokens,
+    )
+
+
 def _generate_with_openai(
     query: str,
     context_list: List[Dict[str, Any]],
@@ -369,21 +424,23 @@ def _generate_with_openai(
     history_summary: Optional[str] = None,
     system_prompt: Optional[str] = None,
     user_template: Optional[str] = None,
+    _runtime: Optional[dict] = None,
 ) -> Tuple[str, Dict[str, int]]:
     """
     Generate answer from context using OpenAI.
     Returns (content, usage_dict with prompt_tokens, completion_tokens).
     """
+    rt = _runtime or get_runtime_llm_settings()
     settings = get_settings()
     empty_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    if not settings.openai_api_key:
-        return "Lỗi: Chưa cấu hình OPENAI_API_KEY.", empty_usage
+    if not rt.get("openai_api_key"):
+        return "Lỗi: Chưa cấu hình OpenAI API key.", empty_usage
 
     if not context_list:
         return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)", empty_usage
 
     template = user_template or USER_PROMPT_TEMPLATE
-    model_name = settings.llm_model
+    model_name = rt.get("model") or settings.llm_model
     encoder = _get_encoder(model_name)
     include_labels = (system_prompt != DRUG_SYSTEM_PROMPT)
     max_output_tokens = settings.llm_max_output_tokens_default
@@ -469,7 +526,7 @@ def _generate_with_openai(
 
     llm = _build_chat_openai_client(
         model_name=model_name,
-        api_key=settings.openai_api_key,
+        api_key=rt.get("openai_api_key") or settings.openai_api_key,
         temperature=0.2,
         max_output_tokens=max_output_tokens,
     )
@@ -518,7 +575,7 @@ def _generate_with_openai(
             try:
                 fallback_llm = _build_chat_openai_client(
                     model_name=fallback_model_name,
-                    api_key=settings.openai_api_key,
+                    api_key=rt.get("openai_api_key") or settings.openai_api_key,
                     temperature=0.2,
                     max_output_tokens=max_output_tokens,
                 )
@@ -571,6 +628,110 @@ def _generate_with_openai(
         return _friendly_llm_error(e), empty_usage
 
 
+def _generate_with_anthropic(
+    query: str,
+    context_list: List[Dict[str, Any]],
+    history: Optional[List[Dict[str, str]]] = None,
+    history_summary: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    user_template: Optional[str] = None,
+    _runtime: Optional[dict] = None,
+) -> Tuple[str, Dict[str, int]]:
+    """Generate answer from context using Anthropic Claude."""
+    rt = _runtime or get_runtime_llm_settings()
+    settings = get_settings()
+    empty_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    api_key = rt.get("anthropic_api_key") or ""
+    if not api_key:
+        return "Lỗi: Chưa cấu hình Anthropic API key.", empty_usage
+
+    if not context_list:
+        return "Tôi không có đủ thông tin cụ thể để trả lời câu hỏi này. (Không tìm thấy ngữ cảnh phù hợp trong cơ sở tài liệu.)", empty_usage
+
+    template = user_template or USER_PROMPT_TEMPLATE
+    model_name = rt.get("model") or "claude-sonnet-4-6"
+    encoder = _get_encoder("gpt-4o")  # use cl100k token counting as approximation
+    include_labels = (system_prompt != DRUG_SYSTEM_PROMPT)
+    max_output_tokens = settings.llm_max_output_tokens_default
+    if (system_prompt or SYSTEM_PROMPT) in (SYSTEM_PROMPT, DRUG_SYSTEM_PROMPT, COMBINED_SYSTEM_PROMPT):
+        max_output_tokens = settings.llm_max_output_tokens_legal
+
+    llm_total_budget = max(settings.llm_total_budget_tokens, max_output_tokens + 1500)
+    input_budget = max(1000, llm_total_budget - max_output_tokens)
+
+    system_msg = system_prompt or SYSTEM_PROMPT
+    user_template_without_context = template.format(context="", question=query)
+    fixed_tokens = _count_tokens(system_msg, encoder) + _count_tokens(user_template_without_context, encoder)
+    available_dynamic_tokens = max(400, input_budget - fixed_tokens)
+
+    history_budget = int(available_dynamic_tokens * settings.llm_history_budget_ratio)
+    context_budget = int(available_dynamic_tokens * settings.llm_context_budget_ratio)
+    slack = max(120, available_dynamic_tokens - history_budget - context_budget)
+
+    history_messages: List[Dict[str, str]] = []
+    history_used = 0
+    if history_summary:
+        summary_text = _truncate_to_tokens(history_summary, max(40, history_budget // 2), encoder)
+        if summary_text:
+            history_messages.append({"role": "user", "content": f"[Tóm tắt hội thoại trước đó: {summary_text}]"})
+            history_messages.append({"role": "assistant", "content": "Đã ghi nhận."})
+            history_used += _count_tokens(history_messages[-2]["content"], encoder)
+
+    raw_history = []
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                raw_history.append({"role": role, "content": content})
+    for msg in raw_history[-8:]:
+        content_tokens = _count_tokens(msg["content"], encoder)
+        if history_used + content_tokens <= history_budget:
+            history_messages.append(msg)
+            history_used += content_tokens
+        else:
+            remaining = history_budget - history_used
+            if remaining >= 30:
+                clipped = _truncate_to_tokens(msg["content"], remaining, encoder)
+                if clipped:
+                    history_messages.append({"role": msg["role"], "content": clipped})
+            break
+
+    per_item_soft_cap = max(120, min(settings.llm_context_chunk_soft_cap_tokens, context_budget // max(1, len(context_list))))
+    context_block = _select_context_by_token_budget(
+        context_list=context_list,
+        total_context_budget_tokens=max(120, context_budget + slack // 2),
+        include_labels=include_labels,
+        encoder=encoder,
+        per_item_soft_cap_tokens=per_item_soft_cap,
+    )
+    user_msg = template.format(context=context_block, question=query)
+
+    # Anthropic requires alternating user/assistant turns; history_messages may already be structured.
+    # Ensure the final message is from the user.
+    # Prepend system message as a dict — LangChain ChatAnthropic extracts it as Anthropic's system param.
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_msg}]
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": user_msg})
+
+    try:
+        llm = _build_chat_anthropic_client(
+            model_name=model_name,
+            api_key=api_key,
+            temperature=0.2,
+            max_output_tokens=max_output_tokens,
+        )
+        resp = llm.invoke(messages)
+        content = _extract_text_content(resp)
+        if not content:
+            content = _friendly_llm_error(ValueError("empty_content"))
+        usage = _extract_usage(resp)
+        return content, usage
+    except Exception as e:
+        logger.exception("Anthropic invoke failed. model=%s query=%r", model_name, (query or "")[:200])
+        return _friendly_llm_error(e), empty_usage
+
+
 def generate_answer(
     query: str,
     context_list: List[Dict[str, Any]],
@@ -579,8 +740,19 @@ def generate_answer(
     system_prompt: Optional[str] = None,
     user_template: Optional[str] = None,
 ) -> Tuple[str, Dict[str, int]]:
-    """Return (grounded answer with citations, usage_dict)."""
+    """Return (grounded answer with citations, usage_dict).
+
+    Automatically routes to the correct LLM provider based on the runtime
+    settings stored in the database (set via the admin panel).
+    """
+    rt = get_runtime_llm_settings()
+    provider = (rt.get("provider") or "openai").lower()
+    if provider == "anthropic":
+        return _generate_with_anthropic(
+            query, context_list, history=history, history_summary=history_summary,
+            system_prompt=system_prompt, user_template=user_template, _runtime=rt,
+        )
     return _generate_with_openai(
         query, context_list, history=history, history_summary=history_summary,
-        system_prompt=system_prompt, user_template=user_template,
+        system_prompt=system_prompt, user_template=user_template, _runtime=rt,
     )

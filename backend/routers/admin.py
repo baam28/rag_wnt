@@ -15,6 +15,8 @@ from deps import (
     UserOut,
     RoleUpdateRequest,
     AdminSetPasswordRequest,
+    ApiSettingsRequest,
+    ApiSettingsResponse,
     FeedbackRequest,
     hash_password,
     get_current_admin,
@@ -30,6 +32,8 @@ from pg_client import (
     get_feedback_collection,
     list_collections,
     get_collection_count,
+    get_app_setting,
+    set_app_setting,
     _q,
 )
 from llm_usage import get_usage
@@ -334,6 +338,75 @@ def admin_set_user_password(
         raise HTTPException(status_code=403, detail="Root admin password cannot be changed by other admin accounts")
     users_coll.update_one({"_id": user_id}, {"$set": {"password_hash": hash_password(req.new_password)}})
     return {"message": "User password updated successfully"}
+
+
+# ---------------------------------------------------------------------------
+# API settings (LLM provider / model / keys)
+# ---------------------------------------------------------------------------
+
+def _mask_key(key: str) -> str:
+    """Return last-4-chars hint; empty string if no key."""
+    k = (key or "").strip()
+    if not k:
+        return ""
+    return "*" * max(0, len(k) - 4) + k[-4:]
+
+
+def _read_api_settings_response() -> ApiSettingsResponse:
+    from config import get_settings
+    s = get_settings()
+
+    provider = get_app_setting("llm_provider") or s.llm_provider or "openai"
+    llm_model = get_app_setting("llm_model") or (s.llm_model if provider == "openai" else "claude-sonnet-4-6")
+    openai_key = get_app_setting("openai_api_key", "")
+    anthropic_key = get_app_setting("anthropic_api_key", "")
+    emb_model = get_app_setting("embedding_model") or s.embedding_model or "voyage-law-2"
+    voyage_key = get_app_setting("voyage_api_key", "")
+
+    return ApiSettingsResponse(
+        provider=provider,
+        model=llm_model,
+        openai_api_key_set=bool(openai_key),
+        anthropic_api_key_set=bool(anthropic_key),
+        openai_api_key_hint=_mask_key(openai_key),
+        anthropic_api_key_hint=_mask_key(anthropic_key),
+        embedding_model=emb_model,
+        voyage_api_key_set=bool(voyage_key),
+        voyage_api_key_hint=_mask_key(voyage_key),
+    )
+
+
+@router.get("/admin/api-settings", response_model=ApiSettingsResponse)
+def get_api_settings(current_user: CurrentUser = Depends(get_current_admin)):
+    return _read_api_settings_response()
+
+
+@router.put("/admin/api-settings", response_model=ApiSettingsResponse)
+def update_api_settings(
+    req: ApiSettingsRequest,
+    current_user: CurrentUser = Depends(get_current_admin),
+):
+    allowed_providers = {"openai", "anthropic"}
+    if req.provider not in allowed_providers:
+        raise HTTPException(status_code=400, detail=f"provider must be one of: {', '.join(sorted(allowed_providers))}")
+    if not req.model.strip():
+        raise HTTPException(status_code=400, detail="LLM model is required")
+    if not req.embedding_model.strip():
+        raise HTTPException(status_code=400, detail="Embedding model is required")
+
+    set_app_setting("llm_provider", req.provider)
+    set_app_setting("llm_model", req.model.strip())
+    set_app_setting("embedding_model", req.embedding_model.strip())
+
+    # Only overwrite API keys when the caller provides a non-empty value
+    if req.openai_api_key is not None and req.openai_api_key.strip():
+        set_app_setting("openai_api_key", req.openai_api_key.strip())
+    if req.anthropic_api_key is not None and req.anthropic_api_key.strip():
+        set_app_setting("anthropic_api_key", req.anthropic_api_key.strip())
+    if req.voyage_api_key is not None and req.voyage_api_key.strip():
+        set_app_setting("voyage_api_key", req.voyage_api_key.strip())
+
+    return _read_api_settings_response()
 
 
 @router.delete("/admin/users/{user_id}")

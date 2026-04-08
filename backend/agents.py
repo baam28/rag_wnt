@@ -16,7 +16,7 @@ When provided, the question is first reformulated into a standalone query via
 import logging
 from typing import Any, Optional, Tuple, List, Dict
 
-from drug_price_tool import execute_drug_sql_query
+from drug_price_tool import execute_drug_sql_query, execute_drug_info_query
 from retriever import retrieve, reformulate_with_history
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,33 @@ def run_price_agent(
             exc_info=True,
         )
     return None, None
+
+
+def run_drug_db_agent(
+    question: str,
+    collections: list[str],
+) -> Optional[dict[str, Any]]:
+    """Query drug_list for structured clinical info when the drug collection is being searched.
+
+    Returns a context dict to merge into final_contexts, or None if no results / not applicable.
+    Skipped automatically when "drug" is not in collections.
+    """
+    if "drug" not in collections:
+        return None
+
+    try:
+        result = execute_drug_info_query(question)
+        if result and len(result.strip()) > 20:
+            return {
+                "content": f"THÔNG TIN THUỐC TỪ DATABASE NỘI BỘ:\n{result}",
+                "source": "Cơ sở dữ liệu Thuốc",
+                "collection_name": None,
+                "rank": 0,
+                "page": None,
+            }
+    except Exception:
+        logger.warning("Drug DB agent failed for query '%s'.", question, exc_info=True)
+    return None
 
 
 def run_federated_rag_agent(

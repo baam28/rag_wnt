@@ -13,9 +13,7 @@ import json
 import logging
 from typing import Any
 
-from langchain_openai import ChatOpenAI
-
-from config import get_settings
+from prompts import build_runtime_chat_client
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +87,10 @@ def _parse_supervisor_response(text: str) -> dict[str, Any] | None:
 
 def get_intent_from_supervisor(question: str) -> dict[str, Any]:
     """Classify intent using the AI supervisor."""
-    settings = get_settings()
-    if not settings.openai_api_key or not question.strip():
+    if not question.strip():
         return {"collections_to_search": ["drug"], "price": False, "price_name": None}
 
-    llm = ChatOpenAI(
-        model=settings.llm_model,
-        api_key=settings.openai_api_key,
-        temperature=0.0,
-    )
+    llm = build_runtime_chat_client(temperature=0.0)
     messages = [
         {"role": "system", "content": SUPERVISOR_SYSTEM},
         {"role": "user", "content": f"Câu hỏi: {question.strip()}\n\nTrả lời bằng JSON theo đúng format đã nêu."},

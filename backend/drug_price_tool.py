@@ -11,7 +11,6 @@ from typing import Any, Tuple
 
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit, create_sql_agent
-from langchain_openai import ChatOpenAI
 
 from config import get_settings
 
@@ -44,6 +43,48 @@ def detect_price_query(question: str) -> Tuple[bool, str]:
 # Text to SQL Agent Wrapper
 # ---------------------------------------------------------------------------
 
+def execute_drug_info_query(question: str) -> str:
+    """Query drug_list for structured clinical info (active ingredient, dosage form, therapeutic class, etc.)."""
+    settings = get_settings()
+    db_url = settings.database_url
+    if db_url.startswith("postgresql://") and "psycopg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
+
+    try:
+        db = SQLDatabase.from_uri(db_url, include_tables=["drug_list"])
+    except Exception as e:
+        logger.error(f"Failed to connect SQLDatabase for drug info: {e}")
+        return ""
+
+    from prompts import build_runtime_chat_client
+    llm = build_runtime_chat_client(temperature=0.0)
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+
+    agent_executor = create_sql_agent(
+        llm=llm,
+        toolkit=toolkit,
+        verbose=False,
+        agent_type="tool-calling",
+        prefix=(
+            "Bạn là trợ lý tra cứu thông tin thuốc từ cơ sở dữ liệu nội bộ. "
+            "Bảng `drug_list` chứa các trường: drug_name (tên thuốc), active_ingredient (hoạt chất), "
+            "dosage (hàm lượng), dosage_form (dạng bào chế), prescription_class (phân loại đơn kê toa), "
+            "therapeutic_class (nhóm trị liệu/phân loại điều trị). "
+            "Hãy viết truy vấn PostgreSQL an toàn (CHỈ SELECT) để tìm các thuốc liên quan đến câu hỏi. "
+            "Dùng ILIKE để tìm kiếm tương đối theo tên thuốc hoặc hoạt chất. "
+            "Chỉ trả về thông tin có trong bảng, không suy diễn thêm. "
+            "Nếu không tìm thấy thuốc liên quan, trả về chuỗi rỗng."
+        )
+    )
+
+    try:
+        result = agent_executor.invoke({"input": question})
+        return result.get("output", "")
+    except Exception as e:
+        logger.error(f"Drug info query failed for '{question}': {e}", exc_info=True)
+        return ""
+
+
 def execute_drug_sql_query(question: str) -> str:
     """Uses a generative Text-to-SQL agent to answer any inventory/drug database question."""
     settings = get_settings()
@@ -57,20 +98,24 @@ def execute_drug_sql_query(question: str) -> str:
         logger.error(f"Failed to connect SQLDatabase: {e}")
         return "Xin lỗi, không thể kết nối tới cơ sở dữ liệu để thực hiện truy vấn."
 
-    llm = ChatOpenAI(model=settings.llm_model, api_key=settings.openai_api_key, temperature=0.0)
+    from prompts import build_runtime_chat_client
+    llm = build_runtime_chat_client(temperature=0.0)
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     
     agent_executor = create_sql_agent(
         llm=llm,
         toolkit=toolkit,
         verbose=False,
-        agent_type="openai-tools",
+        agent_type="tool-calling",
         prefix=(
             "Bạn là trợ lý ảo phân tích trực tiếp cơ sở dữ liệu thuốc/kho hàng ERP của hệ thống y tế. "
             "Hãy phân tích kỹ bảng `drug_list` và `drug_inventory`. Cấu trúc liên kết bằng khoá `drug_id`. "
             "Viết và chạy truy vấn PostgreSQL an toàn (CHỈ SELECT) để trả lời câu hỏi của người dùng. "
             "CHỈ trả về các trường thông tin mà câu hỏi yêu cầu — không liệt kê thêm thành phần, dạng bào chế hay giá nếu người dùng không hỏi. "
             "Ví dụ: nếu hỏi về tồn kho thì chỉ trả về tên thuốc và số lượng tồn kho; nếu hỏi về giá thì chỉ trả về tên thuốc và giá. "
+            "QUAN TRỌNG về giá: trường `retail_price` là giá trên MỘT ĐƠN VỊ BÁN (`selling_unit`). "
+            "Khi trình bày giá, LUÔN kèm đơn vị bán — ví dụ '240 VNĐ/viên' hoặc '60.000 VNĐ/hộp'. "
+            "KHÔNG bao giờ trình bày giá mà thiếu đơn vị, vì sẽ gây nhầm lẫn giữa giá/viên và giá/hộp. "
             "Trình bày kết quả bằng Markdown Table hoặc danh sách ngắn gọn. "
             "Tự chủ động search tương đối (ILIKE) để bao phủ sai chính tả từ người dùng."
         )

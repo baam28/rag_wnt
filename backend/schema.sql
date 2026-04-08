@@ -59,15 +59,13 @@ CREATE INDEX IF NOT EXISTS idx_drug_list_name ON drug_list USING gin(drug_name g
 
 -- Stores dynamic inventory and ERP variables
 CREATE TABLE IF NOT EXISTS drug_inventory (
-    inventory_id          SERIAL PRIMARY KEY,
-    drug_id               TEXT NOT NULL REFERENCES drug_list(drug_id) ON DELETE CASCADE,
+    drug_id               TEXT PRIMARY KEY REFERENCES drug_list(drug_id) ON DELETE CASCADE,
     selling_unit          TEXT,
     packaging_size        TEXT,
     retail_price          NUMERIC,
     stock_quantity        INTEGER NOT NULL DEFAULT 0,
     expiry_date           DATE,
-    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(drug_id)
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- ─── Feedback ─────────────────────────────────────────────────────────────────
@@ -146,3 +144,9 @@ CREATE INDEX IF NOT EXISTS idx_chunks_parent ON vector_chunks(collection_name, p
 -- Run manually after ingest:
 --   CREATE INDEX idx_chunks_embedding ON vector_chunks
 --   USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- ─── App Settings (key-value store for runtime config) ───────────────────────
+CREATE TABLE IF NOT EXISTS app_settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL DEFAULT ''
+);

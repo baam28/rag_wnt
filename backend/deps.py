@@ -154,6 +154,31 @@ class AdminSetPasswordRequest(BaseModel):
     new_password: str
 
 
+class ApiSettingsRequest(BaseModel):
+    # LLM
+    provider: str                           # "openai" | "anthropic"
+    model: str                              # e.g. "gpt-4o-mini" or "claude-sonnet-4-6"
+    openai_api_key: Optional[str] = None   # empty = keep existing
+    anthropic_api_key: Optional[str] = None
+    # Embedding
+    embedding_model: str = ""              # e.g. "voyage-law-2" or "text-embedding-3-small"
+    voyage_api_key: Optional[str] = None
+
+
+class ApiSettingsResponse(BaseModel):
+    # LLM
+    provider: str
+    model: str
+    openai_api_key_set: bool
+    anthropic_api_key_set: bool
+    openai_api_key_hint: str
+    anthropic_api_key_hint: str
+    # Embedding
+    embedding_model: str
+    voyage_api_key_set: bool
+    voyage_api_key_hint: str
+
+
 class IngestJobResponse(BaseModel):
     job_id: str
 
