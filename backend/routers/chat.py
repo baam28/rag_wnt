@@ -1,7 +1,7 @@
 """Chat router: chat sessions, messages, /ask endpoint, drug price."""
 
-import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -28,18 +28,22 @@ from prompts import (
     USER_PROMPT_TEMPLATE,
     DRUG_SYSTEM_PROMPT,
     DRUG_USER_PROMPT_TEMPLATE,
-    PRICE_SYSTEM_PROMPT,
-    PRICE_USER_PROMPT_TEMPLATE,
+    ERP_SYSTEM_PROMPT,
+    ERP_USER_PROMPT_TEMPLATE,
     COMBINED_SYSTEM_PROMPT,
     COMBINED_USER_PROMPT_TEMPLATE,
 )
 from supervisor import get_intent_from_supervisor
-from agents import run_price_agent, run_drug_db_agent, run_federated_rag_agent
-from drug_price_tool import execute_drug_sql_query
+from agents import run_erp_agent, run_drug_db_agent, run_federated_rag_agent
+from drug_price_tool import execute_erp_query
 from llm_usage import record_usage
-from legal_crossref import resolve_cross_references, detect_cross_references
+from legal_crossref import resolve_cross_references
 
 router = APIRouter(tags=["chat"])
+
+# Stable UUID v5 namespace for deriving session IDs from legacy non-UUID strings.
+_SESSION_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
 HISTORY_MAX_TURNS = 4
 HISTORY_MAX_MESSAGES = HISTORY_MAX_TURNS * 2
 HISTORY_MAX_CHARS = 800
@@ -108,7 +112,7 @@ def create_chat_session(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     coll = get_chat_sessions_collection()
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = datetime.now(timezone.utc)
     doc = {
         "user_id": current_user.id,
         "title": title,
@@ -171,21 +175,21 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
     try:
-        intent = get_intent_from_supervisor(req.question)
         settings = get_settings()
 
-        price_data: Optional[dict[str, Any]] = None
-        price_ctx: Optional[dict[str, Any]] = None
+        erp_ctx: Optional[dict[str, Any]] = None
         rag_docs: list[dict[str, Any]] = []
 
-        # Build history first — needed by retrieval for follow-up reformulation
+        # Build history before supervisor so intent classification can use conversation context
         history_payload = _sanitize_history(req.history)
         recent_history, history_summary = _prepare_history_for_prompt(history_payload)
 
+        intent = get_intent_from_supervisor(req.question, history=history_payload)
+
         collections = intent.get("collections_to_search", ["drug"])
 
-        # 1. SQL agents — price/inventory and structured drug info from drug_list
-        price_data, price_ctx = run_price_agent(req.question, intent)
+        # 1. SQL agents — ERP/inventory and structured drug info from drug_list
+        erp_ctx = run_erp_agent(req.question, intent)
         drug_db_ctx = run_drug_db_agent(req.question, collections)
 
         # 2. RAG agent — routed by intent["collections_to_search"]
@@ -209,22 +213,30 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             final_contexts.extend(rag_docs)
         if drug_db_ctx:
             final_contexts.append(drug_db_ctx)
-        if price_ctx:
-            final_contexts.append(price_ctx)
+        if erp_ctx:
+            final_contexts.append(erp_ctx)
+
+        # Pre-fetch articles cited by number in the query (e.g. "Điều 13 khoản 1")
+        # so the first generation already has their content and the costly
+        # second retrieve+generate round-trip can be skipped in most cases.
+        has_legal = "legal" in collections
+        if has_legal and settings.enable_crossref_resolution:
+            prefetched = resolve_cross_references(req.question, settings.legal_collection_name)
+            if prefetched:
+                final_contexts = _deduplicate_contexts(final_contexts, prefetched)
 
         # 4. Choose prompt template
         has_rag = bool(rag_docs)
-        has_price = price_ctx is not None
-        has_legal = "legal" in collections
+        has_erp = erp_ctx is not None
         is_legal_only = collections == ["legal"] or physical_collections == [settings.legal_collection_name]
-        is_drug_only = not has_price and (collections == ["drug"] or physical_collections == [settings.drug_collection_name])
-        if has_rag and has_price and has_legal:
-            # Only use COMBINED when mixing legal docs with price data
+        is_drug_only = not has_erp and (collections == ["drug"] or physical_collections == [settings.drug_collection_name])
+        if has_rag and has_erp and has_legal:
+            # Only use COMBINED when mixing legal docs with ERP data
             system_prompt = COMBINED_SYSTEM_PROMPT
             user_template = COMBINED_USER_PROMPT_TEMPLATE
-        elif has_price:
-            system_prompt = PRICE_SYSTEM_PROMPT
-            user_template = PRICE_USER_PROMPT_TEMPLATE
+        elif has_erp:
+            system_prompt = ERP_SYSTEM_PROMPT
+            user_template = ERP_USER_PROMPT_TEMPLATE
         elif is_legal_only:
             system_prompt = SYSTEM_PROMPT
             user_template = USER_PROMPT_TEMPLATE
@@ -245,45 +257,8 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             user_template=user_template,
         )
 
-        # Cross-reference resolution (legal queries only, single hop).
-        # If the LLM answer cites an article it didn't have in context
-        # (e.g. "theo quy định tại khoản 1 Điều 13"), we retrieve that
-        # article and re-generate so the answer includes the actual content.
-        #
-        # Even when the extra context is empty (the article was already in
-        # final_contexts but the LLM chose to just cite it by number), we
-        # still force a re-generation with an explicit expansion instruction
-        # so that the LLM lists the actual content of the referenced clauses.
-        if (is_legal_only or has_legal) and settings.enable_crossref_resolution:
-            detected_refs = detect_cross_references(answer)
-            if detected_refs:
-                extra_ctx = resolve_cross_references(answer, settings.legal_collection_name)
-                extended = _deduplicate_contexts(final_contexts, extra_ctx) if extra_ctx else final_contexts
-                # Build a list of detected article references so the re-generation
-                # prompt can call them out explicitly.
-                ref_list = ", ".join(
-                    f"Điều {r['article']}" + (f" khoản {r['clause']}" if r.get("clause") else "")
-                    for r in detected_refs
-                )
-                crossref_system = (
-                    system_prompt
-                    + f"\n\nBổ sung quan trọng: Context đã được bổ sung nội dung chi tiết của các điều khoản được dẫn chiếu ({ref_list}). "
-                    "Hãy trình bày ĐẦY ĐỦ và TRỰC TIẾP nội dung của từng điểm/khoản đó thay vì chỉ ghi số điều. "
-                    "Không viết 'xem điểm a, b, d khoản 1 Điều 13' — thay vào đó hãy trích dẫn chính xác nội dung."
-                )
-                answer, usage2 = generate_answer(
-                    req.question,
-                    extended,
-                    history=recent_history,
-                    history_summary=history_summary,
-                    system_prompt=crossref_system,
-                    user_template=user_template,
-                )
-                final_contexts = extended
-                usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + usage2.get("prompt_tokens", 0)
-                usage["completion_tokens"] = usage.get("completion_tokens", 0) + usage2.get("completion_tokens", 0)
-
         record_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0))
+        # Note: response field kept as price_data for frontend compatibility
         sources = [
             {
                 "source": c.get("source", "Unknown"),
@@ -298,18 +273,15 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
         # 5. Persist to Postgres
         sessions_coll = get_chat_sessions_collection()
         msgs_coll = get_chat_messages_collection()
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-        import uuid as _uuid
-        _NS = _uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        now = datetime.now(timezone.utc)
 
         def _canonical_session_id(raw: str, user_id: str) -> str:
             """Return raw if it is already a valid UUID, otherwise derive a stable UUID v5."""
             try:
-                _uuid.UUID(raw)
+                uuid.UUID(raw)
                 return raw
             except (ValueError, AttributeError):
-                return str(_uuid.uuid5(_NS, f"{user_id}:{raw}"))
+                return str(uuid.uuid5(_SESSION_NS, f"{user_id}:{raw}"))
 
         session_id = req.session_id
         if session_id:
@@ -332,7 +304,8 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
             sources=sources,
             has_context=len(final_contexts) > 0,
             collection_name=final_contexts[0].get("collection_name") if final_contexts else None,
-            price_data=price_data,
+            # TODO: remove after the frontend stops reading price_data.
+            price_data=None,
             session_id=session_id,
         )
     except ValueError as e:
@@ -346,11 +319,11 @@ def ask(request: Request, req: AskRequest, current_user: CurrentUser = Depends(g
 # ---------------------------------------------------------------------------
 
 @router.post("/drug-price")
-def drug_price(req: DrugPriceRequest):
+def drug_price(req: DrugPriceRequest, current_user: CurrentUser = Depends(get_current_user)):
     if not req.drug_name.strip():
         raise HTTPException(status_code=400, detail="drug_name is required")
     try:
-        result = execute_drug_sql_query(req.drug_name.strip())
+        result = execute_erp_query(req.drug_name.strip())
         return {"result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

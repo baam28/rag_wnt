@@ -7,16 +7,28 @@ endpoints are sync).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
+
 import psycopg
+from psycopg import sql as pgsql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from config import get_settings
+
+# Collections whose IVFFlat index has already been ensured in this process.
+# Prevents _ensure_vector_index from opening a raw connection on every batch insert.
+_vector_index_ensured: set[str] = set()
+_vector_index_lock = threading.Lock()
+
+_chat_messages_seq_present: bool | None = None
+_chat_messages_seq_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Singleton connection pool
@@ -124,13 +136,24 @@ class _UsersProxy:
         doc["_id"] = str(new_id)
         return type("InsertResult", (), {"inserted_id": new_id})()
 
+    # Columns that may be updated via update_one.  Any key outside this set is
+    # rejected to prevent SQL injection through attacker-controlled column names.
+    _UPDATABLE_COLS: frozenset[str] = frozenset({"is_admin", "password_hash", "last_login_at"})
+
     def update_one(self, query: dict, update: dict, upsert: bool = False):
         user_id = _resolve_user_id(query)
         if user_id is None:
             return
         set_data = update.get("$set", {})
         for col, val in set_data.items():
-            _exec(f"UPDATE users SET {col} = %s WHERE id = %s", (val, user_id))
+            if col not in self._UPDATABLE_COLS:
+                raise ValueError(f"Column '{col}' is not allowed in users.update_one")
+            _exec(
+                pgsql.SQL("UPDATE users SET {column} = %s WHERE id = %s").format(
+                    column=pgsql.Identifier(col)
+                ),
+                (val, user_id),
+            )
 
     def delete_one(self, query: dict):
         user_id = _resolve_user_id(query)
@@ -140,7 +163,10 @@ class _UsersProxy:
         return type("DelResult", (), {"deleted_count": cnt})()
 
     def count_documents(self, query: dict) -> int:
-        rows = _q("SELECT COUNT(*) AS n FROM users")
+        if "is_admin" in query:
+            rows = _q("SELECT COUNT(*) AS n FROM users WHERE is_admin = %s", (bool(query["is_admin"]),))
+        else:
+            rows = _q("SELECT COUNT(*) AS n FROM users")
         return int(rows[0]["n"]) if rows else 0
 
     def aggregate(self, pipeline: list) -> list[dict]:
@@ -246,7 +272,7 @@ class _ChatSessionsProxy:
                         (sid, int(user_id or 0), title),
                     )
             except Exception:
-                pass
+                logger.warning("Failed to upsert chat session %s", session_id, exc_info=True)
         elif session_id and "updated_at" in set_data:
             try:
                 _exec(
@@ -254,7 +280,7 @@ class _ChatSessionsProxy:
                     (str(session_id),),
                 )
             except Exception:
-                pass
+                logger.warning("Failed to update chat session %s", session_id, exc_info=True)
 
     def delete_one(self, query: dict):
         try:
@@ -263,11 +289,15 @@ class _ChatSessionsProxy:
                 (str(query["_id"]), int(query["user_id"])),
             )
         except Exception:
+            logger.warning("Failed to delete chat session %s", query.get("_id"), exc_info=True)
             cnt = 0
         return type("DelResult", (), {"deleted_count": cnt})()
 
     def count_documents(self, query: dict) -> int:
-        rows = _q("SELECT COUNT(*) AS n FROM chat_sessions")
+        if "user_id" in query:
+            rows = _q("SELECT COUNT(*) AS n FROM chat_sessions WHERE user_id = %s", (_to_int_or_none(query["user_id"]),))
+        else:
+            rows = _q("SELECT COUNT(*) AS n FROM chat_sessions")
         return int(rows[0]["n"]) if rows else 0
 
     def aggregate(self, pipeline: list) -> list[dict]:
@@ -315,8 +345,9 @@ class _ChatMessagesProxy:
 
     def find(self, query: dict, **kwargs) -> list[dict]:
         try:
+            order_clause = _chat_messages_order_clause()
             rows = _q(
-                "SELECT * FROM chat_messages WHERE session_id = %s AND user_id = %s ORDER BY created_at ASC",
+                f"SELECT * FROM chat_messages WHERE session_id = %s AND user_id = %s {order_clause}",
                 (
                     str(query.get("session_id")) if query.get("session_id") else None,
                     _to_int_or_none(query.get("user_id", 0)),
@@ -324,6 +355,7 @@ class _ChatMessagesProxy:
             )
             return [_msg_row_to_doc(r) for r in rows]
         except Exception:
+            logger.warning("Failed to fetch chat messages for session %s", query.get("session_id"), exc_info=True)
             return []
 
     def delete_many(self, query: dict):
@@ -338,24 +370,43 @@ class _ChatMessagesProxy:
             elif "user_id" in query:
                 _exec("DELETE FROM chat_messages WHERE user_id = %s", (_to_int_or_none(query["user_id"]),))
         except Exception:
-            pass
+            logger.warning("Failed to delete chat messages (query=%s)", query, exc_info=True)
 
     def update_one(self, query: dict, update: dict):
-        session_id = str(query.get("session_id")) if query.get("session_id") else None
-        role = query.get("role")
-        content = query.get("content")
         set_data = update.get("$set", {})
         feedback = set_data.get("feedback")
         comment = set_data.get("feedbackComment", "")
-        if session_id and role and content:
+        msg_id = query.get("_id")
+        if msg_id:
+            # Fast, exact path — update exactly one message by its UUID
             try:
                 _exec(
                     """UPDATE chat_messages SET feedback = %s, feedback_comment = %s
-                       WHERE session_id = %s AND role = %s AND content = %s""",
+                       WHERE id = %s""",
+                    (feedback, comment, str(msg_id)),
+                )
+            except Exception:
+                logger.warning("Failed to update feedback for message %s", msg_id, exc_info=True)
+            return
+        session_id = str(query.get("session_id")) if query.get("session_id") else None
+        role = query.get("role")
+        content = query.get("content")
+        if session_id and role and content:
+            # Fallback: target only the most-recent matching message to avoid
+            # updating duplicate content rows in the same session.
+            try:
+                _exec(
+                    """UPDATE chat_messages SET feedback = %s, feedback_comment = %s
+                       WHERE id = (
+                           SELECT id FROM chat_messages
+                           WHERE session_id = %s AND role = %s AND content = %s
+                           ORDER BY created_at DESC
+                           LIMIT 1
+                       )""",
                     (feedback, comment, session_id, role, content),
                 )
             except Exception:
-                pass
+                logger.warning("Failed to update feedback for message in session %s", session_id, exc_info=True)
 
     def count_documents(self, query: dict) -> int:
         rows = _q("SELECT COUNT(*) AS n FROM chat_messages")
@@ -389,6 +440,30 @@ def _msg_row_to_doc(row: dict) -> dict:
     return doc
 
 
+def _chat_messages_order_clause() -> str:
+    """Return the safest message ordering for the current database schema.
+
+    Older databases may not have the seq column yet; in that case we fall back
+    to id ordering so fetching chat history does not fail.
+    """
+    global _chat_messages_seq_present
+    if _chat_messages_seq_present is None:
+        with _chat_messages_seq_lock:
+            if _chat_messages_seq_present is None:
+                try:
+                    rows = _q(
+                        """SELECT 1
+                           FROM information_schema.columns
+                           WHERE table_name = 'chat_messages'
+                             AND column_name = 'seq'
+                           LIMIT 1"""
+                    )
+                    _chat_messages_seq_present = bool(rows)
+                except Exception:
+                    _chat_messages_seq_present = False
+    return "ORDER BY created_at ASC, seq ASC" if _chat_messages_seq_present else "ORDER BY created_at ASC, id ASC"
+
+
 # ---------------------------------------------------------------------------
 # Drug prices (new structured format)
 # ---------------------------------------------------------------------------
@@ -405,7 +480,8 @@ class _DrugPricesProxy:
             search_term = regex.strip(".*").replace(".*", "%")
             rows = _q("""
                 SELECT l.drug_name, l.active_ingredient, l.dosage_form, l.prescription_class, l.therapeutic_class,
-                       i.selling_unit, i.packaging_size, i.retail_price, i.stock_quantity, i.expiry_date
+                       i.batch_number, i.selling_unit, i.packaging_size, i.retail_price, i.stock_quantity,
+                       i.batch_date, i.expiry_date
                 FROM drug_list l
                 JOIN drug_inventory i ON l.drug_id = i.drug_id
                 WHERE l.drug_name ILIKE %s LIMIT 20
@@ -413,7 +489,8 @@ class _DrugPricesProxy:
         else:
             rows = _q("""
                 SELECT l.drug_name, l.active_ingredient, l.dosage_form, l.prescription_class, l.therapeutic_class,
-                       i.selling_unit, i.packaging_size, i.retail_price, i.stock_quantity, i.expiry_date
+                       i.batch_number, i.selling_unit, i.packaging_size, i.retail_price, i.stock_quantity,
+                       i.batch_date, i.expiry_date
                 FROM drug_list l
                 JOIN drug_inventory i ON l.drug_id = i.drug_id
                 LIMIT 20
@@ -781,23 +858,51 @@ def insert_vector_chunks(
 
 
 def _ensure_vector_index(collection_name: str, dim: int) -> None:
-    """Create IVFFlat index on embedding column if not already present."""
-    # Check if any rows exist with embeddings of this dimension
-    rows = _q(
-        "SELECT 1 FROM vector_chunks WHERE collection_name = %s AND embedding IS NOT NULL LIMIT 1",
-        (collection_name,),
-    )
-    # Index creation is a DDL statement — run it outside the pool transaction
-    try:
-        with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
-            conn.execute(
-                f"""CREATE INDEX IF NOT EXISTS idx_chunks_embedding_{collection_name.replace('-','_')}
-                    ON vector_chunks USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = 100)
-                    WHERE collection_name = '{collection_name}'"""
+    """Create HNSW index on embedding column if not already present.
+
+    Guards with a module-level set so that at most one raw DDL connection is
+    opened per collection per process lifetime, not on every batch insert.
+
+    HNSW is preferred over IVFFlat because it requires no minimum row count,
+    never needs re-clustering as the corpus grows, and provides better
+    recall/latency trade-offs at any scale.
+    """
+    safe_name = collection_name.replace("-", "_")
+    if not re.fullmatch(r"[a-z0-9_]+", safe_name):
+        logger.warning(
+            "_ensure_vector_index: collection name %r contains invalid characters; "
+            "skipping index creation",
+            collection_name,
+        )
+        return
+    index_name = f"idx_chunks_embedding_{safe_name}"
+
+    with _vector_index_lock:
+        if collection_name in _vector_index_ensured:
+            return
+        # DDL (CREATE INDEX) cannot run inside a transaction; open a dedicated
+        # autocommit connection rather than borrowing one from the pool.
+        # - Index identifier: validated above, then quoted via psycopg.Identifier.
+        # - WHERE predicate value: escaped via psycopg.Literal (never raw-interpolated).
+        try:
+            stmt = pgsql.SQL(
+                "CREATE INDEX IF NOT EXISTS {index} "
+                "ON vector_chunks USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 64) "
+                "WHERE collection_name = {cname}"
+            ).format(
+                index=pgsql.Identifier(index_name),
+                cname=pgsql.Literal(collection_name),
             )
-    except Exception:
-        pass  # Index may already exist or not enough rows yet
+            with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
+                conn.execute(stmt)
+            _vector_index_ensured.add(collection_name)
+        except Exception:
+            logger.warning(
+                "_ensure_vector_index: failed to create HNSW index for %r",
+                collection_name,
+                exc_info=True,
+            )
 
 
 def similarity_search(
@@ -806,23 +911,75 @@ def similarity_search(
     top_k: int = 20,
     payload_filter: dict | None = None,
 ) -> list[dict[str, Any]]:
-    """Dense vector similarity search using pgvector cosine distance."""
+    """Dense vector similarity search using pgvector cosine distance (HNSW index).
+
+    Sets hnsw.ef_search to twice the requested top_k (minimum 100) so the HNSW
+    graph exploration is wide enough for high recall without scanning the whole index.
+    """
     emb_str = f"[{','.join(str(x) for x in query_embedding)}]"
 
     extra_where = ""
-    params: list[Any] = [collection_name, emb_str, top_k]
-
     if payload_filter and payload_filter.get("is_pharma_related"):
         extra_where = " AND (payload->>'is_pharma_related')::boolean = TRUE"
 
+    ef_search = max(100, top_k * 2)
+
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SET LOCAL hnsw.ef_search = {ef_search:d}")
+            cur.execute(
+                f"""SELECT id, parent_id, chunk_index, text, payload,
+                           1 - (embedding <=> %s::vector) AS score
+                    FROM vector_chunks
+                    WHERE collection_name = %s AND embedding IS NOT NULL{extra_where}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s""",
+                (emb_str, collection_name, emb_str, top_k),
+            )
+            return cur.fetchall()
+
+
+def bm25_search(
+    collection_name: str,
+    q_indices: list[int],
+    q_values: list[float],
+    top_k: int = 20,
+    payload_filter: dict | None = None,
+) -> list[dict[str, Any]]:
+    """Independent BM25 retrieval via sparse dot-product in PostgreSQL.
+
+    Uses a lateral unnest join to compute the dot product between the query
+    sparse vector and each stored chunk's sparse vector entirely in-database.
+    Chunks with zero overlap are excluded (they would score 0 anyway), so only
+    documents that share at least one token with the query are returned.
+    """
+    if not q_indices:
+        return []
+
+    extra_where = ""
+    if payload_filter and payload_filter.get("is_pharma_related"):
+        extra_where = " AND (vc.payload->>'is_pharma_related')::boolean = TRUE"
+
     rows = _q(
-        f"""SELECT id, parent_id, chunk_index, text, payload,
-                   1 - (embedding <=> %s::vector) AS score
-            FROM vector_chunks
-            WHERE collection_name = %s AND embedding IS NOT NULL{extra_where}
-            ORDER BY embedding <=> %s::vector
+        f"""WITH q AS (
+                SELECT unnest(%s::int[]) AS qi, unnest(%s::float8[]) AS qv
+            )
+            SELECT vc.id, vc.parent_id, vc.chunk_index, vc.text, vc.payload,
+                   vc.sparse_indices, vc.sparse_values,
+                   SUM(q.qv * d.dv) AS score
+            FROM vector_chunks vc
+            CROSS JOIN LATERAL (
+                SELECT unnest(vc.sparse_indices) AS di,
+                       unnest(vc.sparse_values)  AS dv
+            ) d
+            JOIN q ON q.qi = d.di
+            WHERE vc.collection_name = %s
+              AND vc.sparse_indices IS NOT NULL{extra_where}
+            GROUP BY vc.id, vc.parent_id, vc.chunk_index, vc.text, vc.payload,
+                     vc.sparse_indices, vc.sparse_values
+            ORDER BY score DESC
             LIMIT %s""",
-        (emb_str, collection_name, emb_str, top_k),
+        (q_indices, q_values, collection_name, top_k),
     )
     return rows
 
@@ -855,7 +1012,7 @@ def _ensure_app_settings_table() -> None:
                 "(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"
             )
     except Exception:
-        pass
+        logger.warning("Failed to create app_settings table", exc_info=True)
 
 
 def get_app_setting(key: str, default: str = "") -> str:
@@ -865,7 +1022,7 @@ def get_app_setting(key: str, default: str = "") -> str:
         if rows:
             return str(rows[0]["value"] or "")
     except Exception:
-        pass
+        logger.warning("Failed to read app setting '%s'", key, exc_info=True)
     return default
 
 
@@ -887,7 +1044,7 @@ def set_app_setting(key: str, value: str) -> None:
                 (key, value),
             )
         except Exception:
-            pass
+            logger.warning("Failed to set app setting '%s' after table creation", key, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

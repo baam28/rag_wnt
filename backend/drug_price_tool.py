@@ -1,12 +1,8 @@
-"""Tool: text-to-sql agent for database ERP query.
-
-Ethical scraping compliance
----------------------------
-Data is pre-scraped via offline task and queried from `drug_list` and `drug_inventory` tables.
-"""
+"""Tool: text-to-sql agent for database ERP query."""
 
 import logging
 import re
+import threading
 from typing import Any, Tuple
 
 from langchain_community.utilities import SQLDatabase
@@ -15,6 +11,32 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit, create_sql_ag
 from config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQLDatabase singleton cache
+# ---------------------------------------------------------------------------
+# SQLDatabase.from_uri() creates a SQLAlchemy engine and introspects the schema.
+# Both are expensive: engine creation opens DB connections outside the app pool,
+# and schema introspection runs information_schema queries. Cache per table-set
+# so every query reuses the same engine and its built-in connection pool.
+# The LLM (toolkit + agent) is still built per-call because it is runtime-
+# swappable from the admin panel without restarting the server.
+
+_sql_db_lock = threading.Lock()
+_sql_db_cache: dict[frozenset, SQLDatabase] = {}
+
+
+def _get_sql_db(tables: list[str]) -> SQLDatabase:
+    key = frozenset(tables)
+    with _sql_db_lock:
+        if key not in _sql_db_cache:
+            settings = get_settings()
+            db_url = settings.database_url
+            if db_url.startswith("postgresql://") and "psycopg" not in db_url:
+                db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
+            _sql_db_cache[key] = SQLDatabase.from_uri(db_url, include_tables=tables)
+        return _sql_db_cache[key]
+
 
 # ---------------------------------------------------------------------------
 # Price-query detection (used by the supervisor / router to auto-route)
@@ -45,15 +67,10 @@ def detect_price_query(question: str) -> Tuple[bool, str]:
 
 def execute_drug_info_query(question: str) -> str:
     """Query drug_list for structured clinical info (active ingredient, dosage form, therapeutic class, etc.)."""
-    settings = get_settings()
-    db_url = settings.database_url
-    if db_url.startswith("postgresql://") and "psycopg" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
-
     try:
-        db = SQLDatabase.from_uri(db_url, include_tables=["drug_list"])
+        db = _get_sql_db(["drug_list"])
     except Exception as e:
-        logger.error(f"Failed to connect SQLDatabase for drug info: {e}")
+        logger.error(f"Failed to get SQLDatabase for drug info: {e}")
         return ""
 
     from prompts import build_runtime_chat_client
@@ -79,23 +96,19 @@ def execute_drug_info_query(question: str) -> str:
 
     try:
         result = agent_executor.invoke({"input": question})
-        return result.get("output", "")
+        output = result.get("output", "")
+        return output if isinstance(output, str) else str(output)
     except Exception as e:
         logger.error(f"Drug info query failed for '{question}': {e}", exc_info=True)
         return ""
 
 
-def execute_drug_sql_query(question: str) -> str:
-    """Uses a generative Text-to-SQL agent to answer any inventory/drug database question."""
-    settings = get_settings()
-    db_url = settings.database_url
-    if db_url.startswith("postgresql://") and "psycopg" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
-        
+def execute_erp_query(question: str) -> str:
+    """Uses a generative Text-to-SQL agent to answer any ERP/inventory question (price, stock, expiry, packaging)."""
     try:
-        db = SQLDatabase.from_uri(db_url, include_tables=["drug_list", "drug_inventory"])
+        db = _get_sql_db(["drug_list", "drug_inventory"])
     except Exception as e:
-        logger.error(f"Failed to connect SQLDatabase: {e}")
+        logger.error(f"Failed to get SQLDatabase for ERP: {e}")
         return "Xin lỗi, không thể kết nối tới cơ sở dữ liệu để thực hiện truy vấn."
 
     from prompts import build_runtime_chat_client
@@ -109,11 +122,20 @@ def execute_drug_sql_query(question: str) -> str:
         agent_type="tool-calling",
         prefix=(
             "Bạn là trợ lý ảo phân tích trực tiếp cơ sở dữ liệu thuốc/kho hàng ERP của hệ thống y tế. "
-            "Hãy phân tích kỹ bảng `drug_list` và `drug_inventory`. Cấu trúc liên kết bằng khoá `drug_id`. "
+            "Hai bảng liên kết qua khoá `drug_id`:\n"
+            "  - `drug_list`: drug_id (PK), drug_name (tên thuốc), active_ingredient (hoạt chất), "
+            "dosage (hàm lượng), dosage_form (dạng bào chế), prescription_class (phân loại kê đơn), "
+            "therapeutic_class (nhóm điều trị).\n"
+            "  - `drug_inventory`: drug_id (FK), batch_number (mã lô), selling_unit (đơn vị bán: viên/hộp/chai...), "
+            "packaging_size (quy cách đóng gói, ví dụ '100 viên/hộp'), "
+            "retail_price (giá bán lẻ theo MỘT đơn vị bán, kiểu NUMERIC), "
+            "stock_quantity (số lượng tồn kho, kiểu INTEGER), "
+            "batch_date (ngày nhập/lô hàng, kiểu DATE), "
+            "expiry_date (hạn sử dụng, kiểu DATE).\n"
             "Viết và chạy truy vấn PostgreSQL an toàn (CHỈ SELECT) để trả lời câu hỏi của người dùng. "
             "CHỈ trả về các trường thông tin mà câu hỏi yêu cầu — không liệt kê thêm thành phần, dạng bào chế hay giá nếu người dùng không hỏi. "
-            "Ví dụ: nếu hỏi về tồn kho thì chỉ trả về tên thuốc và số lượng tồn kho; nếu hỏi về giá thì chỉ trả về tên thuốc và giá. "
-            "QUAN TRỌNG về giá: trường `retail_price` là giá trên MỘT ĐƠN VỊ BÁN (`selling_unit`). "
+            "Ví dụ: nếu hỏi về tồn kho thì chỉ trả về tên thuốc và stock_quantity; nếu hỏi về giá thì chỉ trả về tên thuốc, retail_price và selling_unit. "
+            "QUAN TRỌNG về giá: retail_price là giá trên MỘT đơn vị bán (selling_unit). "
             "Khi trình bày giá, LUÔN kèm đơn vị bán — ví dụ '240 VNĐ/viên' hoặc '60.000 VNĐ/hộp'. "
             "KHÔNG bao giờ trình bày giá mà thiếu đơn vị, vì sẽ gây nhầm lẫn giữa giá/viên và giá/hộp. "
             "Trình bày kết quả bằng Markdown Table hoặc danh sách ngắn gọn. "

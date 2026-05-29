@@ -1,9 +1,9 @@
-"""Domain agents: price scraper + two RAG agents (legal and drug).
+"""Domain agents: ERP/inventory SQL agent + two RAG agents (legal and drug).
 
 Intent routing
 --------------
-The supervisor emits {"collections_to_search": ["legal", "drug"], "price": bool, "price_name": str|None}.
-  - run_price_agent         → always called when intent["price"] is True
+The supervisor emits {"collections_to_search": ["legal", "drug"], "erp": bool, "erp_drug_name": str|None}.
+  - run_erp_agent           → always called when intent["erp"] is True
   - run_federated_rag_agent → searches across all provided collections simultaneously
 
 History-aware retrieval
@@ -14,9 +14,9 @@ When provided, the question is first reformulated into a standalone query via
 """
 
 import logging
-from typing import Any, Optional, Tuple, List, Dict
+from typing import Any, Optional, List, Dict
 
-from drug_price_tool import execute_drug_sql_query, execute_drug_info_query
+from drug_price_tool import execute_erp_query, execute_drug_info_query
 from retriever import retrieve, reformulate_with_history
 
 logger = logging.getLogger(__name__)
@@ -25,35 +25,34 @@ logger = logging.getLogger(__name__)
 # SQL Database Agent Wrapper
 # ---------------------------------------------------------------------------
 
-def run_price_agent(
+def run_erp_agent(
     question: str,
     intent: dict[str, Any],
-) -> Tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-    """Invoke SQL semantic agent if intent indicates an inventory query.
-    Returns (None, price_context). We no longer emit raw price_data for the frontend widget.
+) -> Optional[dict[str, Any]]:
+    """Invoke the ERP SQL agent for any inventory query (price, stock, expiry, packaging).
+    Returns an erp_context dict on success, or None.
     """
-    if not intent.get("price"):
-        return None, None
-        
+    if not intent.get("erp"):
+        return None
+
     try:
-        sql_answer = execute_drug_sql_query(question)
+        sql_answer = execute_erp_query(question)
         if sql_answer and "Xin lỗi" not in sql_answer:
-            price_ctx = {
+            return {
                 "content": f"KẾT QUẢ TỪ DATABASE ERP/KHO:\n{sql_answer}",
                 "source": "Cơ sở dữ liệu Thuốc Nội Bộ",
-                "summary": "Truy vấn dữ liệu thuốc/tồn kho",
+                "summary": "Truy vấn dữ liệu ERP/kho thuốc",
                 "collection_name": None,
                 "rank": 0,
                 "page": None,
             }
-            return None, price_ctx
     except Exception:
         logger.warning(
-            "SQL agent failed for query '%s'.",
+            "ERP SQL agent failed for query '%s'.",
             question,
             exc_info=True,
         )
-    return None, None
+    return None
 
 
 def run_drug_db_agent(
@@ -97,6 +96,7 @@ def run_federated_rag_agent(
         return retrieve(
             retrieval_query,
             collections_to_search=collections_to_search,
+            history=history or [],
             pharma_only=pharma_only,
         )
     except Exception:

@@ -144,6 +144,7 @@ class FeedbackRequest(BaseModel):
     rating: str  # "up" or "down"
     comment: Optional[str] = None
     session_id: Optional[str] = None
+    message_id: Optional[str] = None  # UUID of the assistant message being rated
 
 
 class RoleUpdateRequest(BaseModel):
@@ -155,28 +156,13 @@ class AdminSetPasswordRequest(BaseModel):
 
 
 class ApiSettingsRequest(BaseModel):
-    # LLM
-    provider: str                           # "openai" | "anthropic"
-    model: str                              # e.g. "gpt-4o-mini" or "claude-sonnet-4-6"
-    openai_api_key: Optional[str] = None   # empty = keep existing
-    anthropic_api_key: Optional[str] = None
-    # Embedding
-    embedding_model: str = ""              # e.g. "voyage-law-2" or "text-embedding-3-small"
-    voyage_api_key: Optional[str] = None
+    provider: str   # "openai" | "anthropic"
+    model: str      # e.g. "gpt-4o-mini" or "claude-sonnet-4-6"
 
 
 class ApiSettingsResponse(BaseModel):
-    # LLM
     provider: str
     model: str
-    openai_api_key_set: bool
-    anthropic_api_key_set: bool
-    openai_api_key_hint: str
-    anthropic_api_key_hint: str
-    # Embedding
-    embedding_model: str
-    voyage_api_key_set: bool
-    voyage_api_key_hint: str
 
 
 class IngestJobResponse(BaseModel):

@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     hybrid_top_k: int = 20
     rerank_top_k: int = 5
     rerank_top_k_legal: int = 8  # higher top-k for legal queries (multi-khoản articles)
+    dense_score_threshold: float = 0.30  # discard results below this cosine similarity
+    dense_multi_query_k: int = 2  # number of query variations to embed for dense search (including primary)
+    rerank_input_k: int = 20  # max candidates fed to CrossEncoder across all collections (pre-filter by RRF score)
+    rerank_score_threshold: float = 0.0  # CrossEncoder logit below this → excluded before LLM prompt
 
     # Rate limiting (slowapi format: "N/period" where period = second/minute/hour)
     ask_rate_limit: str = "20/minute"
@@ -112,11 +116,7 @@ def get_settings() -> Settings:
 
 
 def get_runtime_llm_settings() -> dict:
-    """Return the active LLM provider/model/api_key, preferring DB overrides.
-
-    Reads from the app_settings table (set by admin panel).  Falls back to
-    the static config/env values so the system works without any DB override.
-    """
+    """Return the active LLM provider/model and DB-backed API keys."""
     from pg_client import get_app_setting  # local import to avoid circular deps
 
     static = get_settings()
@@ -141,16 +141,9 @@ def get_runtime_llm_settings() -> dict:
 
 
 def get_runtime_embedding_settings() -> dict:
-    """Return the active embedding model and API keys, preferring DB overrides."""
-    from pg_client import get_app_setting  # local import to avoid circular deps
-
+    """Return Voyage AI embedding settings from environment."""
     static = get_settings()
-    model = get_app_setting("embedding_model") or static.embedding_model or "voyage-law-2"
-    openai_key = get_app_setting("openai_api_key") or static.openai_api_key
-    voyage_key = get_app_setting("voyage_api_key") or static.voyage_api_key
-
     return {
-        "model": model,
-        "openai_api_key": openai_key,
-        "voyage_api_key": voyage_key,
+        "model": "voyage-law-2",
+        "voyage_api_key": static.voyage_api_key,
     }

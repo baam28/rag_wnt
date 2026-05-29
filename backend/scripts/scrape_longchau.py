@@ -117,26 +117,44 @@ def upsert_drug(conn, data: dict):
             data["therapeutic_category"],
         ))
 
-        stock_quantity = 0 if random.random() < 0.05 else random.randint(10, 500)
-        expiry_date = datetime.now().date() + timedelta(days=random.randint(180, 1000))
+        # Deterministic batch count: most drugs have 1 batch, a subset has 2-3 batches.
+        # This creates realistic duplicate products across different lot dates.
+        seed = sum(ord(ch) for ch in data["drug_code"])
+        if seed % 25 == 0:
+            batch_count = 3
+        elif seed % 10 == 0:
+            batch_count = 2
+        else:
+            batch_count = 1
 
-        cur.execute("""
-            INSERT INTO drug_inventory
-                (drug_id, selling_unit, packaging_size, retail_price, stock_quantity, expiry_date)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (drug_id) DO UPDATE
-            SET selling_unit   = EXCLUDED.selling_unit,
-                packaging_size = EXCLUDED.packaging_size,
-                retail_price   = EXCLUDED.retail_price,
-                updated_at     = NOW()
-        """, (
-            data["drug_code"],
-            data["price_per_unit"],
-            data["package_size"],
-            data["price"],
-            stock_quantity,
-            expiry_date,
-        ))
+        for idx in range(batch_count):
+            stock_quantity = 0 if random.random() < 0.05 else random.randint(10, 500)
+            batch_date = datetime.now().date() - timedelta(days=random.randint(7 + idx * 30, 180 + idx * 45))
+            expiry_date = batch_date + timedelta(days=random.randint(365, 900))
+            batch_number = f"{data['drug_code'][:8].upper()}-B{idx + 1:03d}"
+
+            cur.execute("""
+                INSERT INTO drug_inventory
+                    (drug_id, batch_number, selling_unit, packaging_size, retail_price, stock_quantity, batch_date, expiry_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (drug_id, batch_number) DO UPDATE
+                SET selling_unit   = EXCLUDED.selling_unit,
+                    packaging_size = EXCLUDED.packaging_size,
+                    retail_price   = EXCLUDED.retail_price,
+                    stock_quantity = EXCLUDED.stock_quantity,
+                    batch_date     = EXCLUDED.batch_date,
+                    expiry_date    = EXCLUDED.expiry_date,
+                    updated_at     = NOW()
+            """, (
+                data["drug_code"],
+                batch_number,
+                data["price_per_unit"],
+                data["package_size"],
+                data["price"],
+                stock_quantity,
+                batch_date,
+                expiry_date,
+            ))
     conn.commit()
 
 # ─── A-Z Index: collect all product URLs ───────────────────────────────────────

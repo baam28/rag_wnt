@@ -805,6 +805,7 @@ function App() {
         rating,
         comment: comment || "",
         session_id: activeSessionId || "",
+        message_id: msg.id || "",
       }),
     }).catch((err) => console.error("Feedback submit error:", err));
   }

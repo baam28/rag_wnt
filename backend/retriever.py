@@ -6,21 +6,20 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_voyageai import VoyageAIEmbeddings
 from sentence_transformers import CrossEncoder
 
 from config import get_settings, get_runtime_embedding_settings, get_runtime_llm_settings
 from legal_tokenizer import legal_tokenize_query as _legal_tokenize_query
 from pg_client import (
+    bm25_search,
     load_sparse_bm25_stats,
     load_sparse_vocab_map,
     load_vector_parents,
     load_sibling_parent_ids,
     similarity_search,
 )
-from utils import fix_position_ids as _fix_position_ids, tokenize_for_sparse as _tokenize_for_sparse
 
 logger = logging.getLogger(__name__)
 
@@ -143,20 +142,21 @@ def rewrite_and_expand_query(
         text = content.strip()
         parsed: dict[str, Any] | None = None
 
-        for candidate in [text, None]:
-            if candidate is None:
-                start = text.find("{")
-                end = text.rfind("}")
-                if start == -1 or end <= start:
-                    break
-                candidate = text[start : end + 1]
-            try:
-                obj = json.loads(candidate)
-                if isinstance(obj, dict):
-                    parsed = obj
-                    break
-            except Exception:
-                continue
+        # Try parsing the full response first; fall back to extracting the first {...} block.
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                parsed = obj
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    obj = json.loads(text[start : end + 1])
+                    if isinstance(obj, dict):
+                        parsed = obj
+                except json.JSONDecodeError:
+                    pass
 
         if not parsed:
             return expand_query(
@@ -394,30 +394,95 @@ def _query_to_sparse_indices_values(
     return indices, values
 
 
-def _load_sparse_vocab(collection_name: str) -> dict[str, int] | None:
-    """Load sparse vocab for collection from PostgreSQL. Returns None if not found."""
+# ---------------------------------------------------------------------------
+# In-process BM25 vocab + stats cache (per collection, invalidated on ingest)
+# ---------------------------------------------------------------------------
+
+_bm25_vocab_cache: dict[str, dict[str, int]] = {}
+_bm25_stats_cache: dict[str, tuple[float, dict[str, float]]] = {}
+_bm25_cache_lock = threading.Lock()
+
+
+def invalidate_bm25_cache(collection_name: str | None = None) -> None:
+    """Evict BM25 vocab/stats cache entries for a collection (or all collections if None)."""
+    with _bm25_cache_lock:
+        if collection_name is None:
+            _bm25_vocab_cache.clear()
+            _bm25_stats_cache.clear()
+        else:
+            _bm25_vocab_cache.pop(collection_name, None)
+            _bm25_stats_cache.pop(collection_name, None)
+
+
+def _get_bm25_vocab(collection_name: str) -> dict[str, int] | None:
+    with _bm25_cache_lock:
+        cached = _bm25_vocab_cache.get(collection_name)
+    if cached is not None:
+        return cached
     vocab = load_sparse_vocab_map(collection_name)
-    return vocab or None
+    if not vocab:
+        return None
+    with _bm25_cache_lock:
+        _bm25_vocab_cache[collection_name] = vocab
+    return vocab
 
 
-def _bm25_rescore(
-    rows: list[dict],
-    query_indices: list[int],
-    query_values: list[float],
+def _get_bm25_stats(collection_name: str) -> tuple[float, dict[str, float]]:
+    with _bm25_cache_lock:
+        cached = _bm25_stats_cache.get(collection_name)
+    if cached is not None:
+        return cached
+    result = load_sparse_bm25_stats(collection_name)
+    with _bm25_cache_lock:
+        _bm25_stats_cache[collection_name] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# RRF fusion
+# ---------------------------------------------------------------------------
+
+_RRF_K = 60  # standard Reciprocal Rank Fusion constant
+
+
+def _rrf_fuse(
+    dense_rows: list[dict],
+    bm25_rows: list[dict],
+    dense_score_threshold: float = 0.0,
 ) -> list[dict]:
-    """Add a BM25 sparse score component to dense similarity results."""
-    if not query_indices or not rows:
-        return rows
-    q_vec = {idx: val for idx, val in zip(query_indices, query_values)}
-    for row in rows:
-        sparse_indices = row.get("sparse_indices") or []
-        sparse_values = row.get("sparse_values") or []
-        d_vec = {idx: val for idx, val in zip(sparse_indices, sparse_values)}
-        dot = sum(q_vec.get(idx, 0.0) * val for idx, val in d_vec.items())
-        dense_score = float(row.get("score", 0.0))
-        # Simple RRF-style combination: 0.7 dense + 0.3 sparse (normalised)
-        row["score"] = 0.7 * dense_score + 0.3 * min(dot, 1.0)
-    return rows
+    """Reciprocal Rank Fusion over independent dense and BM25 candidate sets.
+
+    Each candidate receives 1/(k + rank) per list in which it appears; the fused
+    score is the sum.  Dense candidates below dense_score_threshold are excluded
+    from the dense ranking (but remain reachable via BM25 if they appear there).
+    No score normalisation is needed — RRF is rank-based only.
+
+    Returns merged rows sorted by descending RRF score.
+    """
+    filtered_dense = [r for r in dense_rows if float(r.get("score", 0.0)) >= dense_score_threshold]
+
+    dense_rank: dict[str, int] = {str(r["id"]): i + 1 for i, r in enumerate(filtered_dense)}
+    bm25_rank: dict[str, int] = {str(r["id"]): i + 1 for i, r in enumerate(bm25_rows)}
+
+    row_by_id: dict[str, dict] = {str(r["id"]): r for r in filtered_dense}
+    for r in bm25_rows:
+        rid = str(r["id"])
+        if rid not in row_by_id:
+            row_by_id[rid] = r
+
+    fused: list[dict] = []
+    for rid, row in row_by_id.items():
+        rrf_score = 0.0
+        if rid in dense_rank:
+            rrf_score += 1.0 / (_RRF_K + dense_rank[rid])
+        if rid in bm25_rank:
+            rrf_score += 1.0 / (_RRF_K + bm25_rank[rid])
+        merged = dict(row)
+        merged["score"] = rrf_score
+        fused.append(merged)
+
+    fused.sort(key=lambda r: r["score"], reverse=True)
+    return fused
 
 
 def hybrid_search(
@@ -428,33 +493,83 @@ def hybrid_search(
     top_k: int = 20,
     pharma_only: bool = False,
 ) -> list[tuple[str, dict, float]]:
-    """
-    Hybrid search using pgvector dense + BM25 sparse re-scoring.
-    Returns list of (doc_id, metadata, score).
-    """
-    q_embeddings = embeddings.embed_documents(query_variations)
-    # Use the first embedding (primary query) for dense search
-    primary_embedding = q_embeddings[0] if q_embeddings else []
+    """True hybrid search: independent dense (HNSW) + BM25 retrieval fused with RRF.
 
+    Dense step: embeds primary query plus the first (dense_multi_query_k - 1)
+    variations in one batch, runs similarity_search for each, and unions results
+    keeping the max cosine score per id.  Candidates below dense_score_threshold
+    are excluded from the dense ranking before RRF but remain reachable via BM25.
+
+    BM25 step: independently retrieves top-K candidates from PostgreSQL using a
+    lateral-unnest sparse dot-product.  Documents that rank high in BM25 but fall
+    outside the dense top-K are now included — this is the key fix over
+    fetch-and-rescore.
+
+    Fusion: Reciprocal Rank Fusion (k=60) — no score normalisation required.
+
+    Returns list of (doc_id, metadata, rrf_score).
+    """
+    settings = get_settings()
     payload_filter = {"is_pharma_related": True} if pharma_only else None
-    rows = similarity_search(
-        collection_name=collection_name,
-        query_embedding=primary_embedding,
-        top_k=top_k,
-        payload_filter=payload_filter,
-    )
 
-    # Load sparse vocab for BM25 enrichment
-    sparse_vocab = _load_sparse_vocab(collection_name)
-    if sparse_vocab:
-        _, bm25_idf_map = load_sparse_bm25_stats(collection_name)
+    # Build BM25 sparse query vector before spawning threads — vocab is cached in-process.
+    vocab = _get_bm25_vocab(collection_name)
+    q_indices: list[int] = []
+    q_values: list[float] = []
+    if vocab:
+        _, bm25_idf_map = _get_bm25_stats(collection_name)
         q_indices, q_values = _query_to_sparse_indices_values(
-            query, query_variations, sparse_vocab, bm25_idf_map or None
+            query, query_variations, vocab, bm25_idf_map or None
         )
-        rows = _bm25_rescore(rows, q_indices, q_values)
+
+    # Embed all query variants before spawning threads so the embedding client
+    # (which may hold its own lock) is not called from multiple threads.
+    n_dense = max(1, settings.dense_multi_query_k)
+    queries_to_embed = [query] + list(query_variations[: n_dense - 1])
+    if hasattr(embeddings, "embed_documents"):
+        all_embeddings = embeddings.embed_documents(queries_to_embed)
+    else:
+        all_embeddings = [embeddings.embed_query(q) for q in queries_to_embed]
+
+    # --- Dense + BM25 in parallel ---
+    # Both searches hit PostgreSQL independently; running them concurrently
+    # eliminates one serialised round-trip at the cost of two pool connections.
+    def _dense_search() -> list[dict]:
+        best: dict[str, dict] = {}
+        for emb in all_embeddings:
+            for row in similarity_search(
+                collection_name=collection_name,
+                query_embedding=emb,
+                top_k=top_k,
+                payload_filter=payload_filter,
+            ):
+                rid = str(row["id"])
+                if rid not in best or float(row.get("score", 0.0)) > float(best[rid].get("score", 0.0)):
+                    best[rid] = row
+        return sorted(best.values(), key=lambda r: float(r.get("score", 0.0)), reverse=True)
+
+    def _bm25_search() -> list[dict]:
+        if not q_indices:
+            return []
+        return bm25_search(
+            collection_name=collection_name,
+            q_indices=q_indices,
+            q_values=q_values,
+            top_k=top_k,
+            payload_filter=payload_filter,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        dense_future = pool.submit(_dense_search)
+        bm25_future = pool.submit(_bm25_search)
+        dense_rows = dense_future.result()
+        bm25_rows = bm25_future.result()
+
+    # --- RRF fusion ---
+    fused = _rrf_fuse(dense_rows, bm25_rows, dense_score_threshold=settings.dense_score_threshold)
 
     out: list[tuple[str, dict, float]] = []
-    for row in rows:
+    for row in fused:
         score = float(row.get("score", 0.0))
         payload = row.get("payload") or {}
         if isinstance(payload, str):
@@ -462,7 +577,6 @@ def hybrid_search(
                 payload = json.loads(payload)
             except Exception:
                 payload = {}
-        # Attach sparse vectors so rerank can access them
         payload["_sparse_indices"] = row.get("sparse_indices") or []
         payload["_sparse_values"] = row.get("sparse_values") or []
         out.append((str(row["id"]), payload, score))
@@ -498,25 +612,13 @@ _llm_lock = threading.Lock()
 
 
 def _build_embeddings(rt: dict):
-    """Instantiate the correct embedding client from a runtime-settings dict."""
-    model = rt.get("model") or "voyage-law-2"
-    if model.startswith("voyage-"):
-        return VoyageAIEmbeddings(
-            model=model,
-            voyage_api_key=rt.get("voyage_api_key") or None,
+    """Instantiate Voyage AI embedding client from runtime settings."""
+    voyage_key = rt.get("voyage_api_key") or ""
+    if not voyage_key:
+        raise RuntimeError(
+            "VOYAGE_API_KEY is not set. Add it to .env and restart the server."
         )
-    if model.startswith("text-embedding"):
-        return OpenAIEmbeddings(
-            model=model,
-            api_key=rt.get("openai_api_key") or "",
-        )
-    # HuggingFace fallback
-    emb = HuggingFaceEmbeddings(
-        model_name=model,
-        model_kwargs={"trust_remote_code": True, "device": "cpu"},
-    )
-    _fix_position_ids(emb.client)
-    return emb
+    return VoyageAIEmbeddings(model="voyage-law-2", voyage_api_key=voyage_key)
 
 
 def get_embeddings():
@@ -563,7 +665,12 @@ def rerank(
     all_ids: list[str],
     top_k: int = 5,
 ) -> list[tuple[str, dict, float]]:
-    """Re-rank candidates with cross-encoder, return top_k."""
+    """Re-rank candidates with CrossEncoder, apply score threshold, return top_k.
+
+    Candidates whose CrossEncoder logit falls below rerank_score_threshold are
+    dropped entirely — they won't appear in the LLM prompt even if fewer than
+    top_k results survive the filter.
+    """
     if not candidates:
         return []
     id_to_idx = {aid: i for i, aid in enumerate(all_ids)}
@@ -576,8 +683,13 @@ def rerank(
         else:
             pairs.append((query, meta.get("parent_content", "")[:2000] or ""))
     reranker = get_reranker()
-    scores = reranker.predict(pairs)
-    scored = [(candidates[i][0], candidates[i][1], float(scores[i])) for i in range(len(candidates))]
+    raw_scores = reranker.predict(pairs)
+    threshold = get_settings().rerank_score_threshold
+    scored = [
+        (candidates[i][0], candidates[i][1], float(raw_scores[i]))
+        for i in range(len(candidates))
+        if float(raw_scores[i]) >= threshold
+    ]
     scored.sort(key=lambda x: x[2], reverse=True)
     return scored[:top_k]
 
@@ -585,7 +697,7 @@ def rerank(
 # --- Parent context ---
 
 def load_parents(collection_name: str) -> dict[str, dict]:
-    """Load parent_id -> {content, summary, target_question, source} from MongoDB."""
+    """Load parent_id -> {content, summary, target_question, source} from PostgreSQL (vector_parents)."""
     return load_vector_parents(collection_name)
 
 
@@ -781,6 +893,12 @@ def retrieve(
 
     if not combined_candidates:
         return []
+
+    # Cap candidates before CrossEncoder to bound inference cost.
+    # Sort by RRF score and keep only the top rerank_input_k across all collections.
+    if len(combined_candidates) > settings.rerank_input_k:
+        combined_candidates.sort(key=lambda c: c[2], reverse=True)
+        combined_candidates = combined_candidates[:settings.rerank_input_k]
 
     # Unified cross-encoder re-ranking over the combined candidate pool
     # Strip the collection name temporarily for the rerank function signature

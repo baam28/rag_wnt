@@ -838,6 +838,11 @@ def ingest_documents(
     ]
     insert_sparse_vocab_entries(collection_name, added_vocab)
     upsert_sparse_bm25_stats(collection_name, avgdl, idf_map)
+    try:
+        from retriever import invalidate_bm25_cache
+        invalidate_bm25_cache(collection_name)
+    except Exception:
+        pass
     progress("sparse", f"Built sparse vocab ({len(merged_vocab)} terms)", 1, 1)
 
     # Build chunk records for pgvector

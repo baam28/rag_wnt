@@ -4,8 +4,8 @@ New intent schema
 -----------------
 {
   "collections_to_search": ["legal", "drug"], # which RAG agents/collections to use
-  "price":      true | false,                  # also run the price-scraper agent
-  "price_name": "<drug name>" | null           # drug name for price lookup
+  "erp":      true | false,                    # also run the ERP/inventory SQL agent
+  "erp_drug_name": "<drug name>" | null        # drug name for ERP lookup
 }
 """
 
@@ -22,17 +22,18 @@ Hệ thống có 2 kho tài liệu RAG:
   1. **drug**  – Thông tin dược phẩm/hoạt chất: cơ chế, tác dụng, liều dùng, chống chỉ định, tác dụng phụ, tương tác thuốc, cách bảo quản, v.v.
   2. **legal** – Văn bản pháp lý: luật dược, nghị định, thông tư, quy định, tiêu chuẩn, thủ tục hành chính liên quan đến dược phẩm.
 
-Ngoài ra có agent tra cứu giá (**price**) hoạt động độc lập với RAG.
+Ngoài ra có agent tra cứu cơ sở dữ liệu ERP/kho (**erp**) hoạt động độc lập với RAG.
+Agent này có thể trả lời mọi câu hỏi liên quan đến dữ liệu thực tế trong kho: giá bán, tồn kho, hạn sử dụng, quy cách đóng gói.
 
 Quy tắc phân loại:
 - Cho phép trả về NHIỀU collection nếu câu hỏi yêu cầu cả hai lĩnh vực (ví dụ: vừa hỏi pháp lý vừa hỏi tác dụng thuốc).
 - Chọn **drug** khi câu hỏi liên quan đến thông tin dược lý/clinical của thuốc hoặc hoạt chất.
 - Chọn **legal** khi câu hỏi hỏi về luật, nghị định, thông tư, quy định, điều kiện kinh doanh, cấp phép, v.v.
-- Khi câu hỏi hỏi giá thuốc, set "price": true và "price_name" là tên thuốc/hoạt chất.
-- Khi không hỏi giá, set "price": false và "price_name": null.
+- Set "erp": true khi câu hỏi cần tra cứu dữ liệu ERP/kho, bao gồm: giá bán, giá thuốc, tồn kho, số lượng trong kho, hạn sử dụng, quy cách đóng gói, đơn vị bán. Kèm "erp_drug_name" là tên thuốc/hoạt chất được hỏi.
+- Khi không cần tra cứu ERP/kho, set "erp": false và "erp_drug_name": null.
 
 Trả lời ĐÚNG THEO format JSON sau (không thêm giải thích ngoài JSON):
-{"collections_to_search": ["drug", "legal"], "price": true/false, "price_name": "tên thuốc hoặc null"}"""
+{"collections_to_search": ["drug", "legal"], "erp": true/false, "erp_drug_name": "tên thuốc hoặc null"}"""
 
 
 def _parse_supervisor_response(text: str) -> dict[str, Any] | None:
@@ -40,23 +41,18 @@ def _parse_supervisor_response(text: str) -> dict[str, Any] | None:
     if not text or not text.strip():
         return None
     text = text.strip()
-    # Try full text first, then extract first {...} block
-    for candidate in [text, None]:
-        if candidate is None:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end <= start:
-                return None
-            candidate = text[start : end + 1]
-        try:
-            data = json.loads(candidate)
-            break
-        except json.JSONDecodeError:
-            if candidate is text:
-                continue
+    # Try parsing the full response first; fall back to extracting the first {...} block.
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
             return None
-    else:
-        return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
 
     if not isinstance(data, dict):
         return None
@@ -65,35 +61,54 @@ def _parse_supervisor_response(text: str) -> dict[str, Any] | None:
     collections = data.get("collections_to_search", ["drug"])
     if not isinstance(collections, list) or not collections:
         collections = ["drug"]
-    
+
     valid_collections = [c for c in collections if c in ("legal", "drug")]
     if not valid_collections:
         valid_collections = ["drug"]
 
-    # price fields
-    price = bool(data.get("price"))
-    price_name = data.get("price_name")
-    if price_name is not None and not isinstance(price_name, str):
-        price_name = None
-    if price_name is not None:
-        price_name = str(price_name).strip() or None
+    # erp fields
+    erp = bool(data.get("erp"))
+    erp_drug_name = data.get("erp_drug_name")
+    if erp_drug_name is not None and not isinstance(erp_drug_name, str):
+        erp_drug_name = None
+    if erp_drug_name is not None:
+        erp_drug_name = str(erp_drug_name).strip() or None
 
     return {
         "collections_to_search": valid_collections,
-        "price": price,
-        "price_name": price_name,
+        "erp": erp,
+        "erp_drug_name": erp_drug_name,
     }
 
 
-def get_intent_from_supervisor(question: str) -> dict[str, Any]:
+def get_intent_from_supervisor(
+    question: str,
+    history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Classify intent using the AI supervisor."""
     if not question.strip():
-        return {"collections_to_search": ["drug"], "price": False, "price_name": None}
+        return {"collections_to_search": ["drug"], "erp": False, "erp_drug_name": None}
+
+    history_text = ""
+    if history:
+        recent = history[-4:]  # last 2 user+assistant turns
+        lines = []
+        for m in recent:
+            content = (m.get("content") or "").strip()[:300]
+            if not content:
+                continue
+            role_label = "Người dùng" if m.get("role") == "user" else "Trợ lý"
+            lines.append(f"{role_label}: {content}")
+        history_text = "\n".join(lines)
+
+    user_content = f"Câu hỏi: {question.strip()}\n\nTrả lời bằng JSON theo đúng format đã nêu."
+    if history_text:
+        user_content = f"Lịch sử hội thoại gần đây:\n{history_text}\n\n{user_content}"
 
     llm = build_runtime_chat_client(temperature=0.0)
     messages = [
         {"role": "system", "content": SUPERVISOR_SYSTEM},
-        {"role": "user", "content": f"Câu hỏi: {question.strip()}\n\nTrả lời bằng JSON theo đúng format đã nêu."},
+        {"role": "user", "content": user_content},
     ]
     try:
         resp = llm.invoke(messages)
@@ -103,5 +118,5 @@ def get_intent_from_supervisor(question: str) -> dict[str, Any]:
             return intent
     except Exception:
         logger.warning("Supervisor LLM call failed.", exc_info=True)
-    # Safe default: search drug collection, no price
-    return {"collections_to_search": ["drug"], "price": False, "price_name": None}
+    # Safe default: search drug collection, no ERP lookup
+    return {"collections_to_search": ["drug"], "erp": False, "erp_drug_name": None}

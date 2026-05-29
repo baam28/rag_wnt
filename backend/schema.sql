@@ -30,6 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id);
 
 CREATE TABLE IF NOT EXISTS chat_messages (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    seq             BIGSERIAL NOT NULL,     -- strict insertion-order tiebreaker
     session_id      UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
     user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role            VARCHAR(20) NOT NULL,   -- 'user' | 'assistant'
@@ -42,6 +43,10 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_user ON chat_messages(user_id);
+
+-- Backward-compatible migration: add seq to existing databases.
+ALTER TABLE IF EXISTS chat_messages
+    ADD COLUMN IF NOT EXISTS seq BIGSERIAL NOT NULL;
 
 -- ─── Drugs & Inventory ────────────────────────────────────────────────────────
 -- Stores core clinical info about the drugs
@@ -59,14 +64,61 @@ CREATE INDEX IF NOT EXISTS idx_drug_list_name ON drug_list USING gin(drug_name g
 
 -- Stores dynamic inventory and ERP variables
 CREATE TABLE IF NOT EXISTS drug_inventory (
-    drug_id               TEXT PRIMARY KEY REFERENCES drug_list(drug_id) ON DELETE CASCADE,
+    drug_id               TEXT NOT NULL REFERENCES drug_list(drug_id) ON DELETE CASCADE,
+    batch_number          TEXT NOT NULL,
     selling_unit          TEXT,
     packaging_size        TEXT,
+    bulk_price            NUMERIC,
     retail_price          NUMERIC,
     stock_quantity        INTEGER NOT NULL DEFAULT 0,
+    batch_date            DATE,
     expiry_date           DATE,
-    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (drug_id, batch_number)
 );
+
+-- Backward-compatible schema update for existing databases.
+ALTER TABLE IF EXISTS drug_inventory
+    ADD COLUMN IF NOT EXISTS batch_date DATE;
+
+ALTER TABLE IF EXISTS drug_inventory
+    ADD COLUMN IF NOT EXISTS batch_number TEXT;
+
+ALTER TABLE IF EXISTS drug_inventory
+    ADD COLUMN IF NOT EXISTS bulk_price NUMERIC;
+
+-- Backfill legacy rows created before batch support.
+UPDATE drug_inventory
+SET batch_number = COALESCE(batch_number, 'BATCH-001')
+WHERE batch_number IS NULL;
+
+ALTER TABLE IF EXISTS drug_inventory
+    ALTER COLUMN batch_number SET NOT NULL;
+
+-- If the old single-column PK exists, migrate to composite PK.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'drug_inventory'::regclass
+          AND contype = 'p'
+          AND conname = 'drug_inventory_pkey'
+    ) THEN
+        ALTER TABLE drug_inventory DROP CONSTRAINT drug_inventory_pkey;
+    END IF;
+EXCEPTION
+    WHEN undefined_table THEN
+        NULL;
+END $$;
+
+ALTER TABLE IF EXISTS drug_inventory
+    ADD CONSTRAINT drug_inventory_pkey PRIMARY KEY (drug_id, batch_number);
+
+ALTER TABLE IF EXISTS drug_inventory
+    DROP COLUMN IF EXISTS expiration_date;
+
+CREATE INDEX IF NOT EXISTS idx_drug_inventory_drug_id ON drug_inventory(drug_id);
 
 -- ─── Feedback ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS feedback (

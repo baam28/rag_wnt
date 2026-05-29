@@ -223,7 +223,14 @@ def detect_cross_references(text: str) -> list[dict[str, Any]]:
                 "query": _build_query(article, clause_str or None, points, doc_hint),
             }
 
-    result = list(refs.values())[: settings.crossref_max_refs]
+    all_refs = list(refs.values())
+    # Sort by number of mentions in the text before applying the cap so that the most
+    # prominent references survive when more than crossref_max_refs are detected.
+    if len(all_refs) > settings.crossref_max_refs:
+        all_refs.sort(
+            key=lambda r: -len(re.findall(rf"[Đđ]iều\s+{re.escape(r['article'])}\b", text, re.UNICODE))
+        )
+    result = all_refs[: settings.crossref_max_refs]
     if result:
         logger.debug("detect_cross_references: found %d ref(s): %s", len(result), [r["query"] for r in result])
     return result
